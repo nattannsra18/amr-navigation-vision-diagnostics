@@ -10,7 +10,7 @@ def generate_launch_description():
     amr_bringup = FindPackageShare("amr_bringup")
     amr_simulation = FindPackageShare("amr_simulation")
 
-    nav2_launch = PathJoinSubstitution([
+    tb3_simulation_launch = PathJoinSubstitution([
         nav2_bringup,
         "launch",
         "tb3_simulation_launch.py",
@@ -28,11 +28,18 @@ def generate_launch_description():
         "warehouse.sdf",
     ])
 
-    simulation = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(nav2_launch),
+    map_file = PathJoinSubstitution([
+        amr_simulation,
+        "maps",
+        "warehouse_map.yaml",
+    ])
+
+    navigation = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(tb3_simulation_launch),
         launch_arguments={
             "world": world_file,
-            "slam": "True",
+            "map": map_file,
+            "slam": "False",
             "params_file": params_file,
             "use_sim_time": "True",
             "autostart": "True",
@@ -41,5 +48,5 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        simulation,
+        navigation,
     ])
