@@ -3,7 +3,7 @@ from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
-
+from launch_ros.actions import Node
 
 def generate_launch_description():
     nav2_bringup = FindPackageShare("nav2_bringup")
@@ -46,7 +46,14 @@ def generate_launch_description():
             "headless": "False",
         }.items(),
     )
+    diagnostics = Node(
+        package="amr_diagnostics",
+        executable="system_monitor",
+        name="amr_system_monitor",
+        output="screen",
+    )
 
     return LaunchDescription([
         navigation,
+	diagnostics,
     ])
