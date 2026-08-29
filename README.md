@@ -15,6 +15,14 @@ A simulation-based Autonomous Mobile Robot (AMR) project built with ROS 2 Jazzy,
 - Three-stop waypoint mission: Pickup, Delivery, and Home
 - ROS 2 simulation time and Gazebo-to-ROS sensor bridges
 
+## Demo Video
+
+The video below runs the interactive end-to-end validation script and verifies ROS 2 system discovery, AMCL localization and TF, Nav2 lifecycle states, sensor streams and frame IDs, navigation commands, ArUco marker ID and pose estimation, marker TF, and AMR health diagnostics.
+
+[![Watch the AMR end-to-end demo](https://img.youtube.com/vi/RUlGBJWJuIA/maxresdefault.jpg)](https://youtu.be/RUlGBJWJuIA)
+
+[Watch the AMR Navigation, ArUco Vision & Diagnostics demo on YouTube](https://youtu.be/RUlGBJWJuIA)
+
 ## Architecture
 
 ```mermaid
@@ -63,6 +71,8 @@ amr-navigation-vision-diagnostics/
 ├── docs/
 │   ├── Nav2_Gazebo_Troubleshooting_TH.md
 │   └── TEST_RESULTS.md
+├── scripts/
+│   └── demo_test.sh       # Interactive end-to-end validation
 └── src/
     ├── amr_bringup/       # Launch files and Nav2 parameters
     ├── amr_diagnostics/   # Sensor and subsystem health monitor
@@ -260,6 +270,18 @@ ros2 topic echo /diagnostics --once \
 ROS diagnostic levels are `0 = OK`, `1 = WARN`, `2 = ERROR`, and `3 = STALE`. The CLI may render level `0` as `"\0"`.
 
 ## Verification
+
+Run the complete interactive end-to-end test after starting `navigation.launch.py`:
+
+```bash
+cd ~/amr-navigation-vision-diagnostics
+chmod +x scripts/demo_test.sh
+./scripts/demo_test.sh
+```
+
+The script guides the operator through setting the initial pose, sending a navigation goal, presenting ArUco marker ID 0 to the camera, and validating diagnostics. A successful run ends with `ALL AMR DEMO TESTS PASSED`.
+
+The checks below can also be run individually.
 
 Check the core sensor streams:
 
