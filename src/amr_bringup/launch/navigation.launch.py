@@ -33,7 +33,17 @@ def generate_launch_description():
         "maps",
         "warehouse_map.yaml",
     ])
+    robot_sdf = PathJoinSubstitution([
+        amr_simulation,
+        "models",
+        "turtlebot3_waffle_rgbd.sdf.xacro",
+    ])
 
+    camera_bridge_launch = PathJoinSubstitution([
+        amr_bringup,
+        "launch",
+        "camera_bridge.launch.py",
+    ])
     navigation = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(tb3_simulation_launch),
         launch_arguments={
@@ -44,6 +54,7 @@ def generate_launch_description():
             "use_sim_time": "True",
             "autostart": "True",
             "headless": "False",
+            "robot_sdf": robot_sdf,
         }.items(),
     )
     diagnostics = Node(
@@ -52,8 +63,11 @@ def generate_launch_description():
         name="amr_system_monitor",
         output="screen",
     )
-
+    camera_bridge = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(camera_bridge_launch),
+    )
     return LaunchDescription([
         navigation,
-	diagnostics,
+        diagnostics,
+        camera_bridge,
     ])

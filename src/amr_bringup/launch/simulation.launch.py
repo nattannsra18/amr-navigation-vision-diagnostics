@@ -28,10 +28,24 @@ def generate_launch_description():
         "warehouse.sdf",
     ])
 
+    # Custom TurtleBot3 model containing RGB and depth cameras
+    robot_sdf = PathJoinSubstitution([
+        amr_simulation,
+        "models",
+        "turtlebot3_waffle_rgbd.sdf.xacro",
+    ])
+
+    camera_bridge_launch = PathJoinSubstitution([
+        amr_bringup,
+        "launch",
+        "camera_bridge.launch.py",
+    ])
+
     simulation = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(nav2_launch),
         launch_arguments={
             "world": world_file,
+            "robot_sdf": robot_sdf,
             "slam": "True",
             "params_file": params_file,
             "use_sim_time": "True",
@@ -40,6 +54,11 @@ def generate_launch_description():
         }.items(),
     )
 
+    camera_bridge = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(camera_bridge_launch),
+    )
+
     return LaunchDescription([
         simulation,
+        camera_bridge,
     ])
