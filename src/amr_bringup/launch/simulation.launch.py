@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import AppendEnvironmentVariable, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
@@ -38,9 +38,17 @@ def generate_launch_description():
     camera_bridge_launch = PathJoinSubstitution([
         amr_bringup,
         "launch",
-        "camera_bridge.launch.py",
+        "camera_bridge.launch.py",	
+    ])
+    models_path = PathJoinSubstitution([
+        amr_simulation,
+        "models",
     ])
 
+    set_gz_resource_path = AppendEnvironmentVariable(
+        "GZ_SIM_RESOURCE_PATH",
+        models_path,
+    )
     simulation = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(nav2_launch),
         launch_arguments={
@@ -59,6 +67,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        set_gz_resource_path,        
         simulation,
         camera_bridge,
     ])

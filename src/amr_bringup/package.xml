@@ -1,11 +1,22 @@
 <?xml version="1.0"?>
-<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<?xml-model
+  href="http://download.ros.org/schema/package_format3.xsd"
+  schematypens="http://relaxng.org/ns/structure/1.0"?>
+
 <package format="3">
   <name>amr_bringup</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="nattann.sra18@gmail.com">nattanns18</maintainer>
-  <license>TODO: License declaration</license>
+
+  <description>
+    Bringup launch files and configuration for the AMR navigation,
+    simulation, vision, and diagnostics system.
+  </description>
+
+  <maintainer email="nattann.sra18@gmail.com">
+    nattanns18
+  </maintainer>
+
+  <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
@@ -13,10 +24,15 @@
   <depend>launch_ros</depend>
   <depend>nav2_bringup</depend>
 
-  <exec_depend>ros_gz_image</exec_depend>
   <exec_depend>nav2_minimal_tb3_sim</exec_depend>
   <exec_depend>xacro</exec_depend>
+
+  <exec_depend>ros_gz_image</exec_depend>
   <exec_depend>ros_gz_bridge</exec_depend>
+
+  <exec_depend>amr_simulation</exec_depend>
+  <exec_depend>amr_diagnostics</exec_depend>
+  <exec_depend>amr_vision</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
@@ -24,6 +40,4 @@
   <export>
     <build_type>ament_cmake</build_type>
   </export>
-  <exec_depend>amr_simulation</exec_depend>
-  <exec_depend>amr_diagnostics</exec_depend>
 </package>

@@ -1,9 +1,13 @@
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import (
+    AppendEnvironmentVariable,
+    IncludeLaunchDescription,
+)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import PathJoinSubstitution
-from launch_ros.substitutions import FindPackageShare
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
+
 
 def generate_launch_description():
     nav2_bringup = FindPackageShare("nav2_bringup")
@@ -33,6 +37,7 @@ def generate_launch_description():
         "maps",
         "warehouse_map.yaml",
     ])
+
     robot_sdf = PathJoinSubstitution([
         amr_simulation,
         "models",
@@ -44,30 +49,54 @@ def generate_launch_description():
         "launch",
         "camera_bridge.launch.py",
     ])
+
+    models_path = PathJoinSubstitution([
+        amr_simulation,
+        "models",
+    ])
+
+    set_gz_resource_path = AppendEnvironmentVariable(
+        "GZ_SIM_RESOURCE_PATH",
+        models_path,
+    )
+
     navigation = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(tb3_simulation_launch),
         launch_arguments={
             "world": world_file,
             "map": map_file,
+            "robot_sdf": robot_sdf,
             "slam": "False",
             "params_file": params_file,
             "use_sim_time": "True",
             "autostart": "True",
             "headless": "False",
-            "robot_sdf": robot_sdf,
         }.items(),
     )
+
     diagnostics = Node(
         package="amr_diagnostics",
         executable="system_monitor",
         name="amr_system_monitor",
         output="screen",
     )
+
     camera_bridge = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(camera_bridge_launch),
     )
+    aruco_detector = Node(
+        package="amr_vision",
+        executable="aruco_detector",
+        name="aruco_detector",
+        output="screen",
+        parameters=[{
+            "use_sim_time": True,
+        }],
+    )
     return LaunchDescription([
+        set_gz_resource_path,
         navigation,
         diagnostics,
         camera_bridge,
+        aruco_detector,
     ])

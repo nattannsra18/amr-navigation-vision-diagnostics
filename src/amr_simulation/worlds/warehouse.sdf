@@ -189,6 +189,11 @@
         </visual>
       </link>
     </model>
-
+    <!-- ArUco station marker: dictionary 4X4_50, ID 0 -->
+    <include>
+      <uri>model://aruco_marker_0</uri>
+      <name>aruco_marker_0</name>
+      <pose>6.38 -0.50 0.50 0 0 0</pose>
+    </include>
   </world>
 </sdf>
