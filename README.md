@@ -12,14 +12,15 @@ A simulation-based Autonomous Mobile Robot (AMR) project built with ROS 2 Jazzy,
 - Simulated LiDAR, wheel odometry, IMU, RGB camera, and depth camera
 - ArUco `DICT_4X4_50` detection, 3D pose estimation, debug images, and marker TF frames
 - Health monitoring for LiDAR, odometry, velocity commands, RGB camera, and ArUco detection
-- Three-stop waypoint mission: Pickup, Delivery, and Home
+- Predefined three-stop waypoint mission client: Pickup, Delivery, and Home
+- Interactive automated verification for navigation, sensors, TF, ArUco, and diagnostics
 - ROS 2 simulation time and Gazebo-to-ROS sensor bridges
 
 ## Demo Video
 
-The video below runs the interactive end-to-end validation script and verifies ROS 2 system discovery, AMCL localization and TF, Nav2 lifecycle states, sensor streams and frame IDs, navigation commands, ArUco marker ID and pose estimation, marker TF, and AMR health diagnostics.
+The video below shows the interactive automated verification script checking ROS 2 discovery, AMCL localization and TF, Nav2 lifecycle states, sensor streams and frame IDs, navigation commands, ArUco marker ID and pose estimation, marker TF, and AMR health diagnostics.
 
-[![Watch the AMR end-to-end demo](https://img.youtube.com/vi/RUlGBJWJuIA/maxresdefault.jpg)](https://youtu.be/RUlGBJWJuIA)
+[![Watch the AMR end-to-end demo](https://img.youtube.com/vi/RUlGBJWJuIA/hqdefault.jpg)](https://youtu.be/RUlGBJWJuIA)
 
 [Watch the AMR Navigation, ArUco Vision & Diagnostics demo on YouTube](https://youtu.be/RUlGBJWJuIA)
 
@@ -36,6 +37,7 @@ flowchart TB
     VISION["ArUco Detector<br/>IDs, poses, marker TF"]
     DIAG["AMR System Monitor<br/>/diagnostics"]
     RVIZ["RViz2<br/>Initial Pose + Nav2 Goal"]
+    MISSION["Waypoint Mission<br/>Pickup → Delivery → Home"]
 
     SIM --> BRIDGE --> SENSOR
     SENSOR --> LOCAL
@@ -45,7 +47,8 @@ flowchart TB
     LOCAL --> NAV
     LOCAL --> RVIZ
     RVIZ --> NAV
-    NAV --> SAFE -->|/cmd_vel| SIM
+    MISSION --> NAV
+    NAV --> SAFE -->|/cmd_vel| BRIDGE
     VISION --> DIAG
     VISION --> RVIZ
     DIAG --> RVIZ
@@ -68,6 +71,7 @@ map
 
 ```text
 amr-navigation-vision-diagnostics/
+├── README.md
 ├── docs/
 │   ├── Nav2_Gazebo_Troubleshooting_TH.md
 │   └── TEST_RESULTS.md
@@ -87,9 +91,10 @@ amr-navigation-vision-diagnostics/
 - ROS 2 Jazzy desktop installation
 - Gazebo Harmonic
 - Python 3
+- Git, rosdep, and colcon
 - A graphics environment capable of running Gazebo and RViz2
 
-The commands below assume ROS 2 Jazzy is installed and `rosdep` has been initialized. Follow the [official ROS 2 Jazzy installation guide](https://docs.ros.org/en/jazzy/Installation.html) first if needed.
+The commands below assume ROS 2 Jazzy is installed. Follow the [official ROS 2 Jazzy installation guide](https://docs.ros.org/en/jazzy/Installation.html) first if needed; the steps below initialize `rosdep` when required.
 
 ## Installation
 
@@ -98,6 +103,9 @@ Install the main runtime tools:
 ```bash
 sudo apt update
 sudo apt install -y \
+  git \
+  python3-colcon-common-extensions \
+  python3-rosdep \
   ros-jazzy-navigation2 \
   ros-jazzy-nav2-bringup \
   ros-jazzy-nav2-minimal-tb3-sim \
@@ -106,6 +114,8 @@ sudo apt install -y \
   ros-jazzy-ros-gz-image \
   ros-jazzy-cv-bridge \
   ros-jazzy-tf2-ros \
+  ros-jazzy-rqt-image-view \
+  ros-jazzy-teleop-twist-keyboard \
   python3-opencv \
   python3-numpy
 ```
@@ -165,8 +175,9 @@ ros2 launch amr_bringup navigation.launch.py
 In RViz2:
 
 1. Click **2D Pose Estimate**, click the robot's approximate position on the map, drag in its forward direction, and release.
-2. Wait for the particle cloud to converge and for localization to become active.
-3. Click **Nav2 Goal**, select a free location, drag to set the desired heading, and release.
+2. Wait for the particle cloud to converge.
+3. Confirm that **Localization** and **Navigation** are active. If Navigation remains inactive after the initial pose is set, click **Startup** in the Navigation 2 panel.
+4. Click **Nav2 Goal**, select a free location, drag to set the desired heading, and release.
 
 Run the predefined Pickup → Delivery → Home mission in another terminal:
 
@@ -175,6 +186,8 @@ source /opt/ros/jazzy/setup.bash
 source ~/amr-navigation-vision-diagnostics/install/setup.bash
 ros2 run amr_navigation waypoint_mission
 ```
+
+The waypoint coordinates are defined for the included `warehouse_map`. Set the initial pose and confirm that Nav2 is active before starting this mission.
 
 ### SLAM mode
 
@@ -187,23 +200,33 @@ source install/setup.bash
 ros2 launch amr_bringup simulation.launch.py
 ```
 
-Drive the robot, then save a completed map with:
+Drive the robot from another sourced terminal:
 
 ```bash
-ros2 run nav2_map_server map_saver_cli -f warehouse_map
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+```
+
+From the repository root, save the completed map with:
+
+```bash
+ros2 run nav2_map_server map_saver_cli \
+  -f src/amr_simulation/maps/warehouse_map
 ```
 
 ## ROS Nodes
 
-Node availability depends on the selected launch mode. The main navigation launch starts or includes the following nodes.
+Node availability depends on the selected launch mode. The table lists key nodes used by saved-map navigation, SLAM, and the optional waypoint mission; not every node runs at the same time.
 
 | Node | Package / component | Responsibility |
 |---|---|---|
 | `/ros_gz_bridge` | `ros_gz_bridge` | Bridges Gazebo clock, LiDAR, odometry, commands, TF, and other simulation interfaces |
 | `/camera_image_bridge` | `ros_gz_image` | Bridges RGB and depth images from Gazebo to ROS 2 |
 | `/camera_info_bridge` | `ros_gz_bridge` | Bridges RGB camera calibration data |
+| `/robot_state_publisher` | `robot_state_publisher` | Publishes the robot's fixed link transforms |
 | `/map_server` | Nav2 | Publishes the saved occupancy grid |
 | `/amcl` | Nav2 | Localizes the robot and publishes the `map → odom` transform |
+| `/lifecycle_manager_localization` | Nav2 | Configures and activates localization nodes |
+| `/lifecycle_manager_navigation` | Nav2 | Configures and activates navigation nodes |
 | `/planner_server` | Nav2 | Computes global paths |
 | `/controller_server` | Nav2 | Computes local motion commands |
 | `/bt_navigator` | Nav2 | Executes navigation behavior trees |
@@ -215,6 +238,8 @@ Node availability depends on the selected launch mode. The main navigation launc
 | `/route_server` | Nav2 | Provides route-planning services when configured |
 | `/aruco_detector` | `amr_vision` | Detects ArUco markers and publishes IDs, poses, TF, and a debug image |
 | `/amr_system_monitor` | `amr_diagnostics` | Aggregates AMR health information on `/diagnostics` |
+| `/slam_toolbox` | SLAM Toolbox | Builds and updates the occupancy map in SLAM mode |
+| `/basic_navigator` | `amr_navigation` (`waypoint_mission`) | Sends the Pickup → Delivery → Home waypoint sequence when run separately |
 
 ## ROS Topics and Actions
 
@@ -225,6 +250,7 @@ Rates are representative values observed in the current simulation configuration
 | `/clock` | `rosgraph_msgs/msg/Clock` | ~1000 Hz | Gazebo bridge | Simulation time for all nodes |
 | `/scan` | `sensor_msgs/msg/LaserScan` | 5 Hz | Gazebo bridge | AMCL, local costmap, collision monitor, diagnostics |
 | `/odom` | `nav_msgs/msg/Odometry` | ~29 Hz | Gazebo bridge | Nav2, TF, and diagnostics |
+| `/imu` | `sensor_msgs/msg/Imu` | 200 Hz configured | Gazebo bridge | Simulated inertial measurements |
 | `/cmd_vel` | `geometry_msgs/msg/Twist` | ~20 Hz while active | Nav2 velocity pipeline | Robot motion command and diagnostics |
 | `/camera/color/image_raw` | `sensor_msgs/msg/Image` | ~15 Hz | Image bridge | ArUco detector and camera health monitoring |
 | `/camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` | Sensor rate | Camera-info bridge | Camera intrinsics for pose estimation |
@@ -244,6 +270,7 @@ Important sensor frames:
 | Data | Frame ID |
 |---|---|
 | LiDAR | `base_scan` |
+| IMU | `imu_link` |
 | RGB image and ArUco poses | `camera_rgb_optical_frame` |
 | Depth image | `camera_depth_frame` |
 | AMCL pose | `map` |
@@ -269,9 +296,9 @@ ros2 topic echo /diagnostics --once \
 
 ROS diagnostic levels are `0 = OK`, `1 = WARN`, `2 = ERROR`, and `3 = STALE`. The CLI may render level `0` as `"\0"`.
 
-## Verification
+## Automated End-to-End Verification
 
-Run the complete interactive end-to-end test after starting `navigation.launch.py`:
+Keep `navigation.launch.py` running in the first terminal. In a second terminal, run:
 
 ```bash
 cd ~/amr-navigation-vision-diagnostics
@@ -281,13 +308,25 @@ chmod +x scripts/demo_test.sh
 
 The script guides the operator through setting the initial pose, sending a navigation goal, presenting ArUco marker ID 0 to the camera, and validating diagnostics. A successful run ends with `ALL AMR DEMO TESTS PASSED`.
 
+When prompted for the marker test, open the annotated camera stream and wait until the green marker boundary, coordinate axes, and ID `0` are visible before pressing Enter:
+
+```bash
+ros2 run rqt_image_view rqt_image_view
+```
+
+Select `/aruco/debug_image` from the topic list.
+
+This is an **interactive automated runtime test**: the checks and pass/fail summary are automated, while the initial pose, navigation goal, and camera direction are supplied by the operator. It does not launch the simulation by itself and is not yet a CI test.
+
 The checks below can also be run individually.
 
 Check the core sensor streams:
 
 ```bash
+timeout 5 ros2 topic hz /clock
 timeout 5 ros2 topic hz /scan
 timeout 5 ros2 topic hz /odom
+timeout 5 ros2 topic hz /imu
 timeout 5 ros2 topic hz /camera/color/image_raw
 timeout 5 ros2 topic hz /camera/depth/image_raw
 ```
@@ -389,6 +428,13 @@ Common checks:
 - If a topic exists but prints no messages, compare publisher and subscriber QoS profiles with `ros2 topic info <topic> -v`.
 - A one-time `Invalid frame ID` message from `tf2_echo` can occur while the TF listener is discovering frames; continuing transform output confirms the chain is available.
 
+## Current Limitations
+
+- The automated verification script requires an already running system and three operator interactions.
+- The waypoint mission uses coordinates tied to the included warehouse map.
+- Depth images are bridged and verified, but they are not yet used by the navigation or ArUco pipeline.
+- Visual odometry, rosbag-based benchmarking, CI integration tests, and physical robot deployment are not implemented yet.
+
 ## Roadmap
 
 - [x] Custom warehouse simulation and robot model
@@ -397,11 +443,13 @@ Common checks:
 - [x] RGB-D camera bridges
 - [x] ArUco detection, pose estimation, and marker TF
 - [x] Multi-sensor diagnostics
-- [x] Multi-waypoint mission
-- [ ] Automated launch and integration tests
+- [x] Predefined multi-waypoint mission client
+- [x] Interactive automated runtime verification (`scripts/demo_test.sh`)
+- [ ] Non-interactive automated launch and integration tests with CI
 - [ ] Rosbag-based experiment datasets and performance reports
 - [ ] Visual odometry and wheel/visual odometry comparison
 - [ ] Physical robot deployment
+- [ ] Repository-wide license and final package metadata cleanup
 
 ## Documentation
 
