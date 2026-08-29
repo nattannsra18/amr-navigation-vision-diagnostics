@@ -79,8 +79,10 @@ def generate_launch_description():
         executable="system_monitor",
         name="amr_system_monitor",
         output="screen",
+        parameters=[{
+            "use_sim_time": True,
+        }],
     )
-
     camera_bridge = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(camera_bridge_launch),
     )
