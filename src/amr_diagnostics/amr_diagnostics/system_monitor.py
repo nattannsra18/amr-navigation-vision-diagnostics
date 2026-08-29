@@ -2,10 +2,10 @@
 
 import math
 
-import rclpy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import PoseArray, Twist
 from nav_msgs.msg import Odometry
+import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, LaserScan
@@ -15,11 +15,11 @@ from std_msgs.msg import Int32MultiArray
 class AmrSystemMonitor(Node):
 
     def __init__(self):
-        super().__init__("amr_system_monitor")
+        super().__init__('amr_system_monitor')
 
         self.diagnostics_publisher = self.create_publisher(
             DiagnosticArray,
-            "/diagnostics",
+            '/diagnostics',
             10,
         )
 
@@ -45,53 +45,53 @@ class AmrSystemMonitor(Node):
         # Camera state
         self.camera_width = 0
         self.camera_height = 0
-        self.camera_encoding = "unknown"
-        self.camera_frame_id = ""
+        self.camera_encoding = 'unknown'
+        self.camera_frame_id = ''
 
         # ArUco state
         self.marker_ids = []
-        self.marker_pose_frame = ""
+        self.marker_pose_frame = ''
         self.marker_position = None
         self.marker_distance = None
 
         self.create_subscription(
             LaserScan,
-            "/scan",
+            '/scan',
             self.scan_callback,
             qos_profile_sensor_data,
         )
 
         self.create_subscription(
             Odometry,
-            "/odom",
+            '/odom',
             self.odom_callback,
             10,
         )
 
         self.create_subscription(
             Twist,
-            "/cmd_vel",
+            '/cmd_vel',
             self.cmd_vel_callback,
             10,
         )
 
         self.create_subscription(
             Image,
-            "/camera/color/image_raw",
+            '/camera/color/image_raw',
             self.camera_callback,
             qos_profile_sensor_data,
         )
 
         self.create_subscription(
             Int32MultiArray,
-            "/aruco/marker_ids",
+            '/aruco/marker_ids',
             self.marker_ids_callback,
             10,
         )
 
         self.create_subscription(
             PoseArray,
-            "/aruco/poses",
+            '/aruco/poses',
             self.marker_poses_callback,
             10,
         )
@@ -103,7 +103,7 @@ class AmrSystemMonitor(Node):
 
         self.log_counter = 0
 
-        self.get_logger().info("AMR system monitor started")
+        self.get_logger().info('AMR system monitor started')
 
     def current_time(self):
         return self.get_clock().now().nanoseconds / 1e9
@@ -185,7 +185,7 @@ class AmrSystemMonitor(Node):
     def make_status(self, name, level, message, values):
         status = DiagnosticStatus()
         status.name = name
-        status.hardware_id = "turtlebot3_waffle_sim"
+        status.hardware_id = 'turtlebot3_waffle_sim'
         status.level = level
         status.message = message
 
@@ -202,11 +202,11 @@ class AmrSystemMonitor(Node):
     def lidar_status(self, now):
         if self.last_scan_time is None:
             return self.make_status(
-                "AMR/LiDAR",
+                'AMR/LiDAR',
                 DiagnosticStatus.ERROR,
-                "No LaserScan data received",
+                'No LaserScan data received',
                 {
-                    "topic": "/scan",
+                    'topic': '/scan',
                 },
             )
 
@@ -214,57 +214,57 @@ class AmrSystemMonitor(Node):
 
         if age > 2.0:
             return self.make_status(
-                "AMR/LiDAR",
+                'AMR/LiDAR',
                 DiagnosticStatus.ERROR,
-                "LaserScan data timeout",
+                'LaserScan data timeout',
                 {
-                    "topic": "/scan",
-                    "age_seconds": f"{age:.2f}",
+                    'topic': '/scan',
+                    'age_seconds': f'{age:.2f}',
                 },
             )
 
         if self.minimum_scan_range is None:
             return self.make_status(
-                "AMR/LiDAR",
+                'AMR/LiDAR',
                 DiagnosticStatus.WARN,
-                "No valid range measurements",
+                'No valid range measurements',
                 {
-                    "topic": "/scan",
+                    'topic': '/scan',
                 },
             )
 
         if self.minimum_scan_range < 0.20:
             return self.make_status(
-                "AMR/LiDAR",
+                'AMR/LiDAR',
                 DiagnosticStatus.WARN,
-                "Obstacle very close",
+                'Obstacle very close',
                 {
-                    "minimum_range_m": (
-                        f"{self.minimum_scan_range:.3f}"
+                    'minimum_range_m': (
+                        f'{self.minimum_scan_range:.3f}'
                     ),
                 },
             )
 
         return self.make_status(
-            "AMR/LiDAR",
+            'AMR/LiDAR',
             DiagnosticStatus.OK,
-            "LaserScan healthy",
+            'LaserScan healthy',
             {
-                "minimum_range_m": (
-                    f"{self.minimum_scan_range:.3f}"
+                'minimum_range_m': (
+                    f'{self.minimum_scan_range:.3f}'
                 ),
-                "age_seconds": f"{age:.2f}",
+                'age_seconds': f'{age:.2f}',
             },
         )
 
     def odometry_status(self, now):
         if self.last_odom_time is None:
             return self.make_status(
-                "AMR/Odometry",
+                'AMR/Odometry',
                 DiagnosticStatus.ERROR,
-                "No odometry data received",
+                'No odometry data received',
                 {
-                    "topic": "/odom",
+                    'topic': '/odom',
                 },
             )
 
@@ -272,38 +272,38 @@ class AmrSystemMonitor(Node):
 
         if age > 2.0:
             return self.make_status(
-                "AMR/Odometry",
+                'AMR/Odometry',
                 DiagnosticStatus.ERROR,
-                "Odometry data timeout",
+                'Odometry data timeout',
                 {
-                    "topic": "/odom",
-                    "age_seconds": f"{age:.2f}",
+                    'topic': '/odom',
+                    'age_seconds': f'{age:.2f}',
                 },
             )
 
         return self.make_status(
-            "AMR/Odometry",
+            'AMR/Odometry',
             DiagnosticStatus.OK,
-            "Odometry healthy",
+            'Odometry healthy',
             {
-                "linear_velocity_mps": (
-                    f"{self.linear_velocity:.3f}"
+                'linear_velocity_mps': (
+                    f'{self.linear_velocity:.3f}'
                 ),
-                "angular_velocity_radps": (
-                    f"{self.angular_velocity:.3f}"
+                'angular_velocity_radps': (
+                    f'{self.angular_velocity:.3f}'
                 ),
-                "age_seconds": f"{age:.2f}",
+                'age_seconds': f'{age:.2f}',
             },
         )
 
     def command_status(self, now):
         if self.last_cmd_vel_time is None:
             return self.make_status(
-                "AMR/VelocityCommand",
+                'AMR/VelocityCommand',
                 DiagnosticStatus.OK,
-                "Robot idle",
+                'Robot idle',
                 {
-                    "topic": "/cmd_vel",
+                    'topic': '/cmd_vel',
                 },
             )
 
@@ -311,24 +311,24 @@ class AmrSystemMonitor(Node):
 
         if age > 2.0:
             return self.make_status(
-                "AMR/VelocityCommand",
+                'AMR/VelocityCommand',
                 DiagnosticStatus.OK,
-                "No recent velocity command",
+                'No recent velocity command',
                 {
-                    "last_command_age_seconds": f"{age:.2f}",
+                    'last_command_age_seconds': f'{age:.2f}',
                 },
             )
 
         return self.make_status(
-            "AMR/VelocityCommand",
+            'AMR/VelocityCommand',
             DiagnosticStatus.OK,
-            "Velocity command active",
+            'Velocity command active',
             {
-                "linear_x": (
-                    f"{self.commanded_linear_velocity:.3f}"
+                'linear_x': (
+                    f'{self.commanded_linear_velocity:.3f}'
                 ),
-                "angular_z": (
-                    f"{self.commanded_angular_velocity:.3f}"
+                'angular_z': (
+                    f'{self.commanded_angular_velocity:.3f}'
                 ),
             },
         )
@@ -336,11 +336,11 @@ class AmrSystemMonitor(Node):
     def camera_status(self, now):
         if self.last_camera_time is None:
             return self.make_status(
-                "AMR/Camera",
+                'AMR/Camera',
                 DiagnosticStatus.ERROR,
-                "No RGB camera data received",
+                'No RGB camera data received',
                 {
-                    "topic": "/camera/color/image_raw",
+                    'topic': '/camera/color/image_raw',
                 },
             )
 
@@ -348,38 +348,38 @@ class AmrSystemMonitor(Node):
 
         if age > 2.0:
             return self.make_status(
-                "AMR/Camera",
+                'AMR/Camera',
                 DiagnosticStatus.ERROR,
-                "RGB camera data timeout",
+                'RGB camera data timeout',
                 {
-                    "topic": "/camera/color/image_raw",
-                    "age_seconds": f"{age:.2f}",
+                    'topic': '/camera/color/image_raw',
+                    'age_seconds': f'{age:.2f}',
                 },
             )
 
         return self.make_status(
-            "AMR/Camera",
+            'AMR/Camera',
             DiagnosticStatus.OK,
-            "RGB camera healthy",
+            'RGB camera healthy',
             {
-                "topic": "/camera/color/image_raw",
-                "resolution": (
-                    f"{self.camera_width}x{self.camera_height}"
+                'topic': '/camera/color/image_raw',
+                'resolution': (
+                    f'{self.camera_width}x{self.camera_height}'
                 ),
-                "encoding": self.camera_encoding,
-                "frame_id": self.camera_frame_id,
-                "age_seconds": f"{age:.2f}",
+                'encoding': self.camera_encoding,
+                'frame_id': self.camera_frame_id,
+                'age_seconds': f'{age:.2f}',
             },
         )
 
     def aruco_status(self, now):
         if self.last_marker_ids_time is None:
             return self.make_status(
-                "AMR/ArUco",
+                'AMR/ArUco',
                 DiagnosticStatus.ERROR,
-                "No ArUco detector data received",
+                'No ArUco detector data received',
                 {
-                    "topic": "/aruco/marker_ids",
+                    'topic': '/aruco/marker_ids',
                 },
             )
 
@@ -387,33 +387,33 @@ class AmrSystemMonitor(Node):
 
         if marker_age > 2.0:
             return self.make_status(
-                "AMR/ArUco",
+                'AMR/ArUco',
                 DiagnosticStatus.ERROR,
-                "ArUco detector data timeout",
+                'ArUco detector data timeout',
                 {
-                    "topic": "/aruco/marker_ids",
-                    "age_seconds": f"{marker_age:.2f}",
+                    'topic': '/aruco/marker_ids',
+                    'age_seconds': f'{marker_age:.2f}',
                 },
             )
 
         if not self.marker_ids:
             return self.make_status(
-                "AMR/ArUco",
+                'AMR/ArUco',
                 DiagnosticStatus.WARN,
-                "No ArUco marker detected",
+                'No ArUco marker detected',
                 {
-                    "topic": "/aruco/marker_ids",
-                    "detector_age_seconds": f"{marker_age:.2f}",
+                    'topic': '/aruco/marker_ids',
+                    'detector_age_seconds': f'{marker_age:.2f}',
                 },
             )
 
         if self.last_marker_pose_time is None:
             return self.make_status(
-                "AMR/ArUco",
+                'AMR/ArUco',
                 DiagnosticStatus.WARN,
-                "Marker detected but pose unavailable",
+                'Marker detected but pose unavailable',
                 {
-                    "marker_ids": str(self.marker_ids),
+                    'marker_ids': str(self.marker_ids),
                 },
             )
 
@@ -421,31 +421,31 @@ class AmrSystemMonitor(Node):
 
         if pose_age > 2.0 or self.marker_position is None:
             return self.make_status(
-                "AMR/ArUco",
+                'AMR/ArUco',
                 DiagnosticStatus.WARN,
-                "Marker pose data unavailable",
+                'Marker pose data unavailable',
                 {
-                    "marker_ids": str(self.marker_ids),
-                    "pose_age_seconds": f"{pose_age:.2f}",
+                    'marker_ids': str(self.marker_ids),
+                    'pose_age_seconds': f'{pose_age:.2f}',
                 },
             )
 
         x, y, z = self.marker_position
 
         return self.make_status(
-            "AMR/ArUco",
+            'AMR/ArUco',
             DiagnosticStatus.OK,
-            "ArUco marker detected",
+            'ArUco marker detected',
             {
-                "marker_ids": str(self.marker_ids),
-                "first_marker_id": self.marker_ids[0],
-                "distance_m": f"{self.marker_distance:.3f}",
-                "position_x_m": f"{x:.3f}",
-                "position_y_m": f"{y:.3f}",
-                "position_z_m": f"{z:.3f}",
-                "frame_id": self.marker_pose_frame,
-                "detector_age_seconds": f"{marker_age:.2f}",
-                "pose_age_seconds": f"{pose_age:.2f}",
+                'marker_ids': str(self.marker_ids),
+                'first_marker_id': self.marker_ids[0],
+                'distance_m': f'{self.marker_distance:.3f}',
+                'position_x_m': f'{x:.3f}',
+                'position_y_m': f'{y:.3f}',
+                'position_z_m': f'{z:.3f}',
+                'frame_id': self.marker_pose_frame,
+                'detector_age_seconds': f'{marker_age:.2f}',
+                'pose_age_seconds': f'{pose_age:.2f}',
             },
         )
 
@@ -469,10 +469,10 @@ class AmrSystemMonitor(Node):
         self.log_counter += 1
 
         if self.log_counter % 5 == 0:
-            summary = ", ".join(
+            summary = ', '.join(
                 (
                     f"{status.name.split('/')[-1]}"
-                    f"={status.message}"
+                    f'={status.message}'
                 )
                 for status in statuses
             )
@@ -495,5 +495,5 @@ def main(args=None):
             rclpy.shutdown()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -4,7 +4,7 @@ package_name = 'amr_diagnostics'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='1.0.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -15,8 +15,8 @@ setup(
     zip_safe=True,
     maintainer='nattanns18',
     maintainer_email='nattann.sra18@gmail.com',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='Runtime health monitoring for AMR sensors, motion, camera, and ArUco perception.',
+    license='Apache-2.0',
     extras_require={
         'test': [
             'pytest',
@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-		'system_monitor = amr_diagnostics.system_monitor:main',
+            'system_monitor = amr_diagnostics.system_monitor:main',
         ],
     },
 )

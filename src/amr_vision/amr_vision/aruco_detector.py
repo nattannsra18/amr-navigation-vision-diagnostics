@@ -3,10 +3,10 @@
 import math
 
 import cv2
-import numpy as np
-import rclpy
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Pose, PoseArray, TransformStamped
+import numpy as np
+import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
@@ -16,56 +16,56 @@ from tf2_ros import TransformBroadcaster
 
 class ArucoDetector(Node):
     def __init__(self):
-        super().__init__("aruco_detector")
+        super().__init__('aruco_detector')
 
         self.declare_parameter(
-            "image_topic",
-            "/camera/color/image_raw",
+            'image_topic',
+            '/camera/color/image_raw',
         )
         self.declare_parameter(
-            "camera_info_topic",
-            "/camera/color/camera_info",
+            'camera_info_topic',
+            '/camera/color/camera_info',
         )
         self.declare_parameter(
-            "marker_length",
+            'marker_length',
             0.45,
         )
         self.declare_parameter(
-            "camera_frame",
-            "camera_rgb_optical_frame",
+            'camera_frame',
+            'camera_rgb_optical_frame',
         )
         self.declare_parameter(
-            "publish_tf",
+            'publish_tf',
             True,
         )
         self.declare_parameter(
-            "marker_frame_prefix",
-            "aruco_marker_",
+            'marker_frame_prefix',
+            'aruco_marker_',
         )
 
         image_topic = self.get_parameter(
-            "image_topic"
+            'image_topic'
         ).value
 
         camera_info_topic = self.get_parameter(
-            "camera_info_topic"
+            'camera_info_topic'
         ).value
 
         self.marker_length = float(
-            self.get_parameter("marker_length").value
+            self.get_parameter('marker_length').value
         )
 
         self.camera_frame = str(
-            self.get_parameter("camera_frame").value
+            self.get_parameter('camera_frame').value
         )
 
         self.publish_tf = bool(
-            self.get_parameter("publish_tf").value
+            self.get_parameter('publish_tf').value
         )
 
         self.marker_frame_prefix = str(
             self.get_parameter(
-                "marker_frame_prefix"
+                'marker_frame_prefix'
             ).value
         )
 
@@ -108,39 +108,39 @@ class ArucoDetector(Node):
 
         self.marker_ids_publisher = self.create_publisher(
             Int32MultiArray,
-            "/aruco/marker_ids",
+            '/aruco/marker_ids',
             10,
         )
 
         self.marker_poses_publisher = self.create_publisher(
             PoseArray,
-            "/aruco/poses",
+            '/aruco/poses',
             10,
         )
 
         self.debug_image_publisher = self.create_publisher(
             Image,
-            "/aruco/debug_image",
+            '/aruco/debug_image',
             qos_profile_sensor_data,
         )
 
         self.get_logger().info(
-            f"Listening for images on {image_topic}"
+            f'Listening for images on {image_topic}'
         )
 
         self.get_logger().info(
-            "Listening for camera information on "
-            f"{camera_info_topic}"
+            'Listening for camera information on '
+            f'{camera_info_topic}'
         )
 
         self.get_logger().info(
-            "ArUco dictionary: DICT_4X4_50, "
-            f"marker length: {self.marker_length:.2f} m"
+            'ArUco dictionary: DICT_4X4_50, '
+            f'marker length: {self.marker_length:.2f} m'
         )
 
         self.get_logger().info(
-            f"Marker TF broadcasting: {self.publish_tf}, "
-            f"frame prefix: {self.marker_frame_prefix}"
+            f'Marker TF broadcasting: {self.publish_tf}, '
+            f'frame prefix: {self.marker_frame_prefix}'
         )
 
     def camera_info_callback(self, message):
@@ -164,19 +164,19 @@ class ArucoDetector(Node):
 
         if first_message:
             self.get_logger().info(
-                "Camera calibration received: "
-                f"{message.width}x{message.height}"
+                'Camera calibration received: '
+                f'{message.width}x{message.height}'
             )
 
     def image_callback(self, message):
         try:
             image = self.bridge.imgmsg_to_cv2(
                 message,
-                desired_encoding="bgr8",
+                desired_encoding='bgr8',
             )
         except CvBridgeError as error:
             self.get_logger().error(
-                f"Unable to convert camera image: {error}"
+                f'Unable to convert camera image: {error}'
             )
             return
 
@@ -247,13 +247,13 @@ class ArucoDetector(Node):
         if current_ids != self.last_detected_ids:
             if current_ids:
                 self.get_logger().info(
-                    "Detected ArUco marker IDs: "
-                    f"{list(current_ids)}"
+                    'Detected ArUco marker IDs: '
+                    f'{list(current_ids)}'
                 )
 
             elif self.last_detected_ids:
                 self.get_logger().info(
-                    "No ArUco marker currently visible"
+                    'No ArUco marker currently visible'
                 )
 
             self.last_detected_ids = current_ids
@@ -277,7 +277,7 @@ class ArucoDetector(Node):
 
         except cv2.error as error:
             self.get_logger().warning(
-                f"Pose estimation failed: {error}"
+                f'Pose estimation failed: {error}'
             )
             return
 
@@ -368,7 +368,7 @@ class ArucoDetector(Node):
         )
 
         transform.child_frame_id = (
-            f"{self.marker_frame_prefix}{marker_id}"
+            f'{self.marker_frame_prefix}{marker_id}'
         )
 
         transform.transform.translation.x = (
@@ -412,13 +412,13 @@ class ArucoDetector(Node):
             debug_message = (
                 self.bridge.cv2_to_imgmsg(
                     debug_image,
-                    encoding="bgr8",
+                    encoding='bgr8',
                 )
             )
 
         except CvBridgeError as error:
             self.get_logger().error(
-                f"Unable to create debug image: {error}"
+                f'Unable to create debug image: {error}'
             )
             return
 
@@ -563,5 +563,5 @@ def main(args=None):
             rclpy.shutdown()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

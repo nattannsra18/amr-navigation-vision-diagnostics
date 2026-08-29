@@ -2,8 +2,8 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>amr_vision</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <version>1.0.0</version>
+  <description>RGB-D perception, ArUco detection, pose estimation, and marker TF for the simulated AMR.</description>
   <maintainer email="nattann.sra18@gmail.com">nattanns18</maintainer>
   <license>Apache-2.0</license>
 

@@ -5,11 +5,10 @@
 
 <package format="3">
   <name>amr_bringup</name>
-  <version>0.0.0</version>
+  <version>1.0.0</version>
 
   <description>
-    Bringup launch files and configuration for the AMR navigation,
-    simulation, vision, and diagnostics system.
+    Integrated launch package for simulation, navigation, vision, and diagnostics.
   </description>
 
   <maintainer email="nattann.sra18@gmail.com">

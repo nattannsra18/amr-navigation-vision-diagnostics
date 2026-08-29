@@ -1,44 +1,44 @@
 from setuptools import find_packages, setup
 
 
-package_name = "amr_vision"
+package_name = 'amr_vision'
 
 
 setup(
     name=package_name,
-    version="0.1.0",
+    version='1.0.0',
     packages=find_packages(
-        exclude=["test"],
+        exclude=['test'],
     ),
     data_files=[
         (
-            "share/ament_index/resource_index/packages",
-            ["resource/" + package_name],
+            'share/ament_index/resource_index/packages',
+            ['resource/' + package_name],
         ),
         (
-            "share/" + package_name,
-            ["package.xml"],
+            'share/' + package_name,
+            ['package.xml'],
         ),
     ],
     install_requires=[
-        "setuptools",
+        'setuptools',
     ],
     zip_safe=True,
-    maintainer="nattanns18",
-    maintainer_email="nattann.sra18@gmail.com",
+    maintainer='nattanns18',
+    maintainer_email='nattann.sra18@gmail.com',
     description=(
-        "RGB-D vision and ArUco detection for "
-        "the simulated AMR."
+        'RGB-D perception, ArUco detection, pose estimation, '
+        'and marker TF for the simulated AMR.'
     ),
-    license="Apache-2.0",
+    license='Apache-2.0',
     tests_require=[
-        "pytest",
+        'pytest',
     ],
     entry_points={
-        "console_scripts": [
+        'console_scripts': [
             (
-                "aruco_detector = "
-                "amr_vision.aruco_detector:main"
+                'aruco_detector = '
+                'amr_vision.aruco_detector:main'
             ),
         ],
     },

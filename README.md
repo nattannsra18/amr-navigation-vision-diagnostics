@@ -445,11 +445,12 @@ Common checks:
 - [x] Multi-sensor diagnostics
 - [x] Predefined multi-waypoint mission client
 - [x] Interactive automated runtime verification (`scripts/demo_test.sh`)
+- [x] Repository-wide license and final package metadata cleanup
 - [ ] Non-interactive automated launch and integration tests with CI
 - [ ] Rosbag-based experiment datasets and performance reports
 - [ ] Visual odometry and wheel/visual odometry comparison
 - [ ] Physical robot deployment
-- [ ] Repository-wide license and final package metadata cleanup
+
 
 ## Documentation
 
