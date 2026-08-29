@@ -4,7 +4,7 @@ project(amr_simulation)
 find_package(ament_cmake REQUIRED)
 
 install(
-  DIRECTORY launch worlds models maps
+  DIRECTORY worlds models maps
   DESTINATION share/${PROJECT_NAME}
 )
 
