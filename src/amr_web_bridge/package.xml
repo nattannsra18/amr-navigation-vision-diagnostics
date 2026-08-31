@@ -2,22 +2,24 @@
 <?xml-model
   href="http://download.ros.org/schema/package_format3.xsd"
   schematypens="http://www.w3.org/2001/XMLSchema"?>
+
 <package format="3">
   <name>amr_web_bridge</name>
   <version>0.1.0</version>
-
   <description>
-    WebSocket Robot Agent connecting the simulated ROS 2 AMR
-    to the Indoor Delivery Robot FastAPI control plane.
+    ROS 2 WebSocket bridge for AMR telemetry and web navigation commands.
   </description>
 
-  <maintainer email="nattann.sra18@gmail.com">
-    nattanns18
+  <maintainer email="nattanon.s184@gmail.com">
+    Nattanon Srasri
   </maintainer>
 
   <license>Apache-2.0</license>
 
+  <buildtool_depend>ament_python</buildtool_depend>
+
   <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
 
   <exec_depend>python3-websockets</exec_depend>
 
