@@ -13,6 +13,7 @@ from typing import Any
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import OccupancyGrid
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -36,6 +37,7 @@ class WebBridgeNode(Node):
         self.declare_parameter('telemetry_period', 1.0)
         self.declare_parameter('reconnect_delay', 3.0)
         self.declare_parameter('pose_topic', '/amcl_pose')
+        self.declare_parameter('map_topic', '/map')
         self.declare_parameter('battery_percent', 100)
         self.declare_parameter(
             'navigate_action',
@@ -60,6 +62,9 @@ class WebBridgeNode(Node):
         self.pose_topic = str(
             self.get_parameter('pose_topic').value
         )
+        self.map_topic = str(
+            self.get_parameter('map_topic').value
+        )
         self.battery_percent = int(
             self.get_parameter('battery_percent').value
         )
@@ -72,8 +77,11 @@ class WebBridgeNode(Node):
 
         self.stop_requested = threading.Event()
         self.telemetry_lock = threading.Lock()
+        self.map_lock = threading.Lock()
         self.command_lock = threading.Lock()
         self.latest_telemetry: dict[str, Any] | None = None
+        self.latest_map: dict[str, Any] | None = None
+        self.map_revision = 0
         self.command_queue: Queue[dict[str, Any]] = Queue()
         self.pending_command_ids: set[str] = set()
         self.active_command: dict[str, Any] | None = None
@@ -94,6 +102,12 @@ class WebBridgeNode(Node):
             PoseWithCovarianceStamped,
             self.pose_topic,
             self.pose_callback,
+            self.pose_qos,
+        )
+        self.map_subscription = self.create_subscription(
+            OccupancyGrid,
+            self.map_topic,
+            self.map_callback,
             self.pose_qos,
         )
 
@@ -122,6 +136,7 @@ class WebBridgeNode(Node):
         self.get_logger().info(
             f'Pose telemetry topic: {self.pose_topic}'
         )
+        self.get_logger().info(f'Map topic: {self.map_topic}')
         self.get_logger().info(
             f'Nav2 action: {self.navigate_action}'
         )
@@ -170,6 +185,44 @@ class WebBridgeNode(Node):
         with self.telemetry_lock:
             self.latest_telemetry = telemetry
 
+    def map_callback(self, message: OccupancyGrid) -> None:
+        origin = message.info.origin
+        orientation = origin.orientation
+
+        sin_yaw = 2.0 * (
+            orientation.w * orientation.z
+            + orientation.x * orientation.y
+        )
+        cos_yaw = 1.0 - 2.0 * (
+            orientation.y * orientation.y
+            + orientation.z * orientation.z
+        )
+        origin_yaw = math.atan2(sin_yaw, cos_yaw)
+        stamp = message.header.stamp
+
+        map_payload = {
+            'frame_id': message.header.frame_id or 'map',
+            'resolution': float(message.info.resolution),
+            'width': int(message.info.width),
+            'height': int(message.info.height),
+            'origin_x': float(origin.position.x),
+            'origin_y': float(origin.position.y),
+            'origin_yaw': float(origin_yaw),
+            'data': [int(value) for value in message.data],
+            'timestamp': (
+                f'{stamp.sec}.{stamp.nanosec:09d}'
+            ),
+        }
+
+        with self.map_lock:
+            self.latest_map = map_payload
+            self.map_revision += 1
+
+        self.get_logger().info(
+            'Received ROS map '
+            f'{message.info.width}x{message.info.height}'
+        )
+
     async def connection_supervisor(self) -> None:
         self.asyncio_loop = asyncio.get_running_loop()
 
@@ -195,6 +248,9 @@ class WebBridgeNode(Node):
                         ),
                         asyncio.create_task(
                             self.telemetry_loop(websocket)
+                        ),
+                        asyncio.create_task(
+                            self.map_loop(websocket)
                         ),
                     ]
 
@@ -256,6 +312,35 @@ class WebBridgeNode(Node):
                     'data': telemetry,
                 },
             )
+
+    async def map_loop(self, websocket: Any) -> None:
+        sent_revision = -1
+
+        while not self.stop_requested.is_set():
+            await asyncio.sleep(0.5)
+
+            with self.map_lock:
+                revision = self.map_revision
+                map_payload = (
+                    dict(self.latest_map)
+                    if self.latest_map is not None
+                    else None
+                )
+
+            if (
+                map_payload is None
+                or revision == sent_revision
+            ):
+                continue
+
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'map',
+                    'data': map_payload,
+                },
+            )
+            sent_revision = revision
 
     async def send_json(
         self,
@@ -336,6 +421,11 @@ class WebBridgeNode(Node):
             self.get_logger().debug('Heartbeat acknowledged')
         elif message_type == 'telemetry_ack':
             self.get_logger().debug('Telemetry acknowledged')
+        elif message_type == 'map_ack':
+            self.get_logger().info(
+                'Map acknowledged by FastAPI: '
+                f"revision {message.get('revision')}"
+            )
         elif message_type == 'command':
             await self.queue_navigation_command(
                 websocket,
