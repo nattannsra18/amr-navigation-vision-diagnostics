@@ -82,9 +82,21 @@ class WebBridgeNode(Node):
         self.latest_telemetry: dict[str, Any] | None = None
         self.latest_map: dict[str, Any] | None = None
         self.map_revision = 0
-        self.command_queue: Queue[dict[str, Any]] = Queue()
+        self.command_queue: Queue[
+            dict[str, Any]
+        ] = Queue()
+        self.cancel_queue: Queue[
+            dict[str, Any]
+        ] = Queue()
         self.pending_command_ids: set[str] = set()
-        self.active_command: dict[str, Any] | None = None
+        self.pending_cancel_requests: dict[
+            str,
+            dict[str, Any],
+        ] = {}
+        self.cancelled_task_ids: set[str] = set()
+        self.active_command: (
+            dict[str, Any] | None
+        ) = None
         self.active_goal_handle: Any = None
         self.last_feedback_log_ns = 0
 
@@ -431,6 +443,11 @@ class WebBridgeNode(Node):
                 websocket,
                 message,
             )
+        elif message_type == 'cancel_navigation':
+            await self.queue_navigation_cancel(
+                websocket,
+                message,
+            )
         elif message_type == 'command_ack_received':
             self.get_logger().info(
                 'FastAPI received command acknowledgement'
@@ -439,6 +456,14 @@ class WebBridgeNode(Node):
             self.get_logger().info(
                 'FastAPI applied navigation result: '
                 f"{message.get('task_status')}"
+            )
+        elif (
+            message_type
+            == 'navigation_cancelled_received'
+        ):
+            self.get_logger().info(
+                'FastAPI confirmed task cancellation: '
+                f"{message.get('task_id')}"
             )
         elif message_type == 'error':
             self.get_logger().warning(
@@ -450,6 +475,47 @@ class WebBridgeNode(Node):
             self.get_logger().debug(
                 f'Unhandled WebSocket message: {message_type}'
             )
+
+    async def queue_navigation_cancel(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+    ) -> None:
+        cancel_id = message.get('cancel_id')
+        task_id = message.get('task_id')
+
+        valid_request = (
+            isinstance(cancel_id, str)
+            and bool(cancel_id)
+            and isinstance(task_id, str)
+            and bool(task_id)
+            and cancel_id.startswith(
+                f'{task_id}:cancel:'
+            )
+        )
+
+        if not valid_request:
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'navigation_cancelled',
+                    'cancel_id': cancel_id,
+                    'task_id': task_id,
+                    'cancelled': False,
+                    'detail': (
+                        'Invalid navigation '
+                        'cancellation request'
+                    ),
+                },
+            )
+            return
+
+        self.cancel_queue.put(message)
+
+        self.get_logger().info(
+            'Queued Nav2 cancellation '
+            f'{cancel_id}'
+        )
 
     async def queue_navigation_command(
         self,
@@ -523,7 +589,213 @@ class WebBridgeNode(Node):
             f'Queued Nav2 command {command_id}'
         )
 
+    def process_cancel_queue(self) -> bool:
+        try:
+            cancel_request = (
+                self.cancel_queue.get_nowait()
+            )
+        except Empty:
+            return False
+
+        cancel_id = str(
+            cancel_request['cancel_id']
+        )
+        task_id = str(
+            cancel_request['task_id']
+        )
+
+        with self.command_lock:
+            self.pending_cancel_requests[
+                task_id
+            ] = cancel_request
+            active_command = self.active_command
+            active_goal_handle = (
+                self.active_goal_handle
+            )
+
+        if active_command is None:
+            with self.command_lock:
+                self.cancelled_task_ids.add(
+                    task_id
+                )
+                self.pending_cancel_requests.pop(
+                    task_id,
+                    None,
+                )
+
+            self.get_logger().info(
+                'No active Nav2 goal for '
+                f'{task_id}; cancellation confirmed'
+            )
+            self.send_navigation_cancelled(
+                cancel_request,
+                True,
+                'No active Nav2 goal remains',
+            )
+            return True
+
+        active_task_id = str(
+            active_command.get('task_id')
+        )
+
+        if active_task_id != task_id:
+            with self.command_lock:
+                self.pending_cancel_requests.pop(
+                    task_id,
+                    None,
+                )
+
+            self.get_logger().warning(
+                f'Cannot cancel {task_id}; '
+                f'active task is {active_task_id}'
+            )
+            self.send_navigation_cancelled(
+                cancel_request,
+                False,
+                (
+                    'Cancellation task does not match '
+                    'the active Nav2 goal'
+                ),
+            )
+            return True
+
+        if active_goal_handle is None:
+            self.get_logger().info(
+                'Waiting for Nav2 goal handle before '
+                f'cancelling {cancel_id}'
+            )
+            return True
+
+        self.request_goal_cancellation(
+            active_command,
+            active_goal_handle,
+            cancel_request,
+        )
+        return True
+
+    def request_goal_cancellation(
+        self,
+        command: dict[str, Any],
+        goal_handle: Any,
+        cancel_request: dict[str, Any],
+    ) -> None:
+        command_id = str(
+            command['command_id']
+        )
+        task_id = str(
+            command['task_id']
+        )
+        cancel_id = str(
+            cancel_request['cancel_id']
+        )
+
+        self.get_logger().info(
+            'Requesting Nav2 cancellation '
+            f'{cancel_id} for {command_id}'
+        )
+
+        try:
+            cancel_future = (
+                goal_handle.cancel_goal_async()
+            )
+        except Exception as error:
+            detail = (
+                'Failed to request Nav2 '
+                f'cancellation: {error}'
+            )
+            self.get_logger().error(detail)
+
+            with self.command_lock:
+                self.pending_cancel_requests.pop(
+                    task_id,
+                    None,
+                )
+
+            self.send_navigation_cancelled(
+                cancel_request,
+                False,
+                detail,
+            )
+            return
+
+        cancel_future.add_done_callback(
+            lambda future: (
+                self.cancel_response_callback(
+                    future,
+                    command,
+                    cancel_request,
+                )
+            )
+        )
+
+    def cancel_response_callback(
+        self,
+        future: Any,
+        command: dict[str, Any],
+        cancel_request: dict[str, Any],
+    ) -> None:
+        task_id = str(
+            command['task_id']
+        )
+        cancel_id = str(
+            cancel_request['cancel_id']
+        )
+
+        try:
+            response = future.result()
+        except Exception as error:
+            detail = (
+                'Failed to receive Nav2 '
+                f'cancellation response: {error}'
+            )
+            self.get_logger().error(detail)
+
+            with self.command_lock:
+                self.pending_cancel_requests.pop(
+                    task_id,
+                    None,
+                )
+
+            self.send_navigation_cancelled(
+                cancel_request,
+                False,
+                detail,
+            )
+            return
+
+        if not response.goals_canceling:
+            detail = (
+                'Nav2 did not accept the '
+                'cancellation request'
+            )
+            self.get_logger().warning(
+                f'{detail}: {cancel_id}'
+            )
+
+            with self.command_lock:
+                self.pending_cancel_requests.pop(
+                    task_id,
+                    None,
+                )
+
+            self.send_navigation_cancelled(
+                cancel_request,
+                False,
+                detail,
+            )
+            return
+
+        self.get_logger().info(
+            'Nav2 accepted cancellation request '
+            f'{cancel_id}; waiting for final result'
+        )
+
     def process_command_queue(self) -> None:
+        # Cancellation always takes priority over
+        # starting another navigation command.
+        if self.process_cancel_queue():
+            return
+
         with self.command_lock:
             if self.active_command is not None:
                 return
@@ -533,10 +805,35 @@ class WebBridgeNode(Node):
         except Empty:
             return
 
-        command_id = str(command['command_id'])
+        command_id = str(
+            command['command_id']
+        )
+        task_id = str(
+            command['task_id']
+        )
+
         with self.command_lock:
-            self.pending_command_ids.discard(command_id)
-            self.active_command = command
+            skip_cancelled_command = (
+                task_id in self.cancelled_task_ids
+            )
+            self.pending_command_ids.discard(
+                command_id
+            )
+
+            if skip_cancelled_command:
+                self.cancelled_task_ids.discard(
+                    task_id
+                )
+            else:
+                self.active_command = command
+
+        if skip_cancelled_command:
+            self.get_logger().info(
+                'Skipping queued Nav2 command '
+                f'{command_id} because task '
+                f'{task_id} was cancelled'
+            )
+            return
 
         if not self.navigation_client.wait_for_server(
             timeout_sec=1.0
@@ -591,32 +888,93 @@ class WebBridgeNode(Node):
         future: Any,
         command: dict[str, Any],
     ) -> None:
-        command_id = str(command['command_id'])
+        command_id = str(
+            command['command_id']
+        )
+        task_id = str(
+            command['task_id']
+        )
 
         try:
             goal_handle = future.result()
         except Exception as error:
-            detail = f'Failed to send Nav2 goal: {error}'
+            detail = (
+                f'Failed to send Nav2 goal: {error}'
+            )
             self.get_logger().error(detail)
-            self.send_command_ack(command, False, detail)
-            self.send_navigation_result(
+            self.send_command_ack(
                 command,
-                'aborted',
+                False,
                 detail,
             )
-            self.clear_active_command(command_id)
+
+            with self.command_lock:
+                cancel_request = (
+                    self.pending_cancel_requests.pop(
+                        task_id,
+                        None,
+                    )
+                )
+
+            if cancel_request is not None:
+                self.send_navigation_cancelled(
+                    cancel_request,
+                    True,
+                    (
+                        'Nav2 goal never became active: '
+                        f'{detail}'
+                    ),
+                )
+            else:
+                self.send_navigation_result(
+                    command,
+                    'aborted',
+                    detail,
+                )
+
+            self.clear_active_command(
+                command_id
+            )
             return
 
         if not goal_handle.accepted:
-            detail = 'Nav2 rejected the navigation goal'
+            detail = (
+                'Nav2 rejected the navigation goal'
+            )
             self.get_logger().warning(detail)
-            self.send_command_ack(command, False, detail)
-            self.send_navigation_result(
+            self.send_command_ack(
                 command,
-                'aborted',
+                False,
                 detail,
             )
-            self.clear_active_command(command_id)
+
+            with self.command_lock:
+                cancel_request = (
+                    self.pending_cancel_requests.pop(
+                        task_id,
+                        None,
+                    )
+                )
+
+            if cancel_request is not None:
+                self.send_navigation_cancelled(
+                    cancel_request,
+                    True,
+                    (
+                        'Nav2 goal was not active '
+                        'because it was rejected'
+                    ),
+                )
+            else:
+                self.send_navigation_result(
+                    command,
+                    'aborted',
+                    detail,
+                )
+
+            self.clear_active_command(
+                command_id
+            )
             return
 
         with self.command_lock:
@@ -631,13 +989,31 @@ class WebBridgeNode(Node):
             'Nav2 accepted the navigation goal',
         )
 
-        result_future = goal_handle.get_result_async()
+        result_future = (
+            goal_handle.get_result_async()
+        )
         result_future.add_done_callback(
-            lambda result: self.navigation_result_callback(
-                result,
-                command,
+            lambda result: (
+                self.navigation_result_callback(
+                    result,
+                    command,
+                )
             )
         )
+
+        with self.command_lock:
+            cancel_request = (
+                self.pending_cancel_requests.get(
+                    task_id
+                )
+            )
+
+        if cancel_request is not None:
+            self.request_goal_cancellation(
+                command,
+                goal_handle,
+                cancel_request,
+            )
 
     def navigation_feedback_callback(self, feedback: Any) -> None:
         now_ns = self.get_clock().now().nanoseconds
@@ -655,39 +1031,135 @@ class WebBridgeNode(Node):
         future: Any,
         command: dict[str, Any],
     ) -> None:
-        command_id = str(command['command_id'])
+        command_id = str(
+            command['command_id']
+        )
+        task_id = str(
+            command['task_id']
+        )
 
         try:
             wrapped_result = future.result()
             status = wrapped_result.status
             result = wrapped_result.result
         except Exception as error:
-            detail = f'Failed to receive Nav2 result: {error}'
-            self.get_logger().error(detail)
-            self.send_navigation_result(
-                command,
-                'aborted',
-                detail,
+            detail = (
+                'Failed to receive Nav2 result: '
+                f'{error}'
             )
-            self.clear_active_command(command_id)
+            self.get_logger().error(detail)
+
+            with self.command_lock:
+                cancel_request = (
+                    self.pending_cancel_requests.pop(
+                        task_id,
+                        None,
+                    )
+                )
+
+            if cancel_request is not None:
+                self.send_navigation_cancelled(
+                    cancel_request,
+                    False,
+                    detail,
+                )
+            else:
+                self.send_navigation_result(
+                    command,
+                    'aborted',
+                    detail,
+                )
+
+            self.clear_active_command(
+                command_id
+            )
             return
 
-        if status == GoalStatus.STATUS_SUCCEEDED:
+        with self.command_lock:
+            cancel_request = (
+                self.pending_cancel_requests.pop(
+                    task_id,
+                    None,
+                )
+            )
+
+        if cancel_request is not None:
+            if (
+                status
+                == GoalStatus.STATUS_CANCELED
+            ):
+                detail = (
+                    'Nav2 goal cancellation completed'
+                )
+            elif (
+                status
+                == GoalStatus.STATUS_SUCCEEDED
+            ):
+                detail = (
+                    'Nav2 goal finished before the '
+                    'cancellation took effect'
+                )
+            else:
+                error_message = getattr(
+                    result,
+                    'error_msg',
+                    '',
+                )
+                detail = (
+                    error_message
+                    or (
+                        'Nav2 goal stopped before '
+                        'cancellation completed'
+                    )
+                )
+
+            self.get_logger().info(
+                'Navigation stopped for cancelled '
+                f'task {task_id}: {detail}'
+            )
+            self.send_navigation_cancelled(
+                cancel_request,
+                True,
+                detail,
+            )
+            self.clear_active_command(
+                command_id
+            )
+            return
+
+        if (
+            status
+            == GoalStatus.STATUS_SUCCEEDED
+        ):
             navigation_status = 'succeeded'
             detail = 'Nav2 goal succeeded'
             self.get_logger().info(
-                f'Navigation succeeded for {command_id}'
+                'Navigation succeeded for '
+                f'{command_id}'
             )
-        elif status == GoalStatus.STATUS_CANCELED:
+
+        elif (
+            status
+            == GoalStatus.STATUS_CANCELED
+        ):
             navigation_status = 'canceled'
             detail = 'Nav2 goal was canceled'
             self.get_logger().warning(
-                f'Navigation canceled for {command_id}'
+                'Navigation canceled for '
+                f'{command_id}'
             )
+
         else:
             navigation_status = 'aborted'
-            error_message = getattr(result, 'error_msg', '')
-            detail = error_message or 'Nav2 goal was aborted'
+            error_message = getattr(
+                result,
+                'error_msg',
+                '',
+            )
+            detail = (
+                error_message
+                or 'Nav2 goal was aborted'
+            )
             self.get_logger().error(
                 'Navigation aborted for '
                 f'{command_id}: {detail}'
@@ -698,7 +1170,9 @@ class WebBridgeNode(Node):
             navigation_status,
             detail,
         )
-        self.clear_active_command(command_id)
+        self.clear_active_command(
+            command_id
+        )
 
     def send_command_ack(
         self,
@@ -728,6 +1202,30 @@ class WebBridgeNode(Node):
                 'task_id': command.get('task_id'),
                 'stage': command.get('stage'),
                 'status': status,
+                'detail': detail,
+            }
+        )
+
+    def send_navigation_cancelled(
+        self,
+        cancel_request: dict[str, Any],
+        cancelled: bool,
+        detail: str,
+    ) -> None:
+        self.send_from_ros(
+            {
+                'type': 'navigation_cancelled',
+                'cancel_id': (
+                    cancel_request.get(
+                        'cancel_id'
+                    )
+                ),
+                'task_id': (
+                    cancel_request.get(
+                        'task_id'
+                    )
+                ),
+                'cancelled': cancelled,
                 'detail': detail,
             }
         )
