@@ -11,6 +11,7 @@ import threading
 from typing import Any
 
 from action_msgs.msg import GoalStatus
+from diagnostic_msgs.msg import DiagnosticArray
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid, Odometry
@@ -39,6 +40,7 @@ class WebBridgeNode(Node):
         self.declare_parameter('pose_topic', '/amcl_pose')
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('odom_topic', '/odom')
+        self.declare_parameter('diagnostics_topic', '/diagnostics')
         self.declare_parameter('battery_percent', 100)
         self.declare_parameter(
             'navigate_action',
@@ -69,6 +71,9 @@ class WebBridgeNode(Node):
         self.odom_topic = str(
             self.get_parameter('odom_topic').value
         )
+        self.diagnostics_topic = str(
+            self.get_parameter('diagnostics_topic').value
+        )
         self.battery_percent = int(
             self.get_parameter('battery_percent').value
         )
@@ -83,13 +88,16 @@ class WebBridgeNode(Node):
         self.telemetry_lock = threading.Lock()
         self.map_lock = threading.Lock()
         self.velocity_lock = threading.Lock()
+        self.diagnostics_lock = threading.Lock()
         self.command_lock = threading.Lock()
         self.latest_telemetry: dict[str, Any] | None = None
         self.latest_map: dict[str, Any] | None = None
+        self.latest_diagnostics: dict[str, Any] | None = None
         self.latest_velocity: (
             dict[str, float] | None
         ) = None
         self.map_revision = 0
+        self.diagnostics_revision = 0
         self.command_queue: Queue[
             dict[str, Any]
         ] = Queue()
@@ -144,6 +152,18 @@ class WebBridgeNode(Node):
             self.odom_callback,
             self.odom_qos,
         )
+        self.diagnostics_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.diagnostics_subscription = self.create_subscription(
+            DiagnosticArray,
+            self.diagnostics_topic,
+            self.diagnostics_callback,
+            self.diagnostics_qos,
+        )
         self.navigation_client = ActionClient(
             self,
             NavigateToPose,
@@ -175,6 +195,9 @@ class WebBridgeNode(Node):
         )
         self.get_logger().info(
             f'Odometry topic: {self.odom_topic}'
+        )
+        self.get_logger().info(
+            f'Diagnostics topic: {self.diagnostics_topic}'
         )
 
     @staticmethod
@@ -250,6 +273,88 @@ class WebBridgeNode(Node):
                 'angular_velocity': angular_velocity,
             }
 
+    @staticmethod
+    def normalize_diagnostic_level(level: Any) -> int | None:
+        if isinstance(level, (bytes, bytearray, memoryview)):
+            raw_bytes = bytes(level)
+            return raw_bytes[0] if raw_bytes else None
+
+        try:
+            return int(level)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def diagnostic_level_name(self, level: Any) -> str:
+        normalized_level = WebBridgeNode.normalize_diagnostic_level(
+            level
+        )
+        level_name = {
+            0: 'OK',
+            1: 'WARN',
+            2: 'ERROR',
+            3: 'STALE',
+        }.get(normalized_level)
+
+        if level_name is None:
+            self.get_logger().warning(
+                'Unknown or empty diagnostic level '
+                f'{level!r}; using STALE'
+            )
+            return 'STALE'
+
+        return level_name
+
+    @staticmethod
+    def diagnostic_timestamp(
+        message: DiagnosticArray,
+    ) -> str | None:
+        stamp = message.header.stamp
+        if stamp.sec == 0 and stamp.nanosec == 0:
+            return None
+
+        try:
+            timestamp = (
+                float(stamp.sec)
+                + float(stamp.nanosec) / 1e9
+            )
+            return datetime.fromtimestamp(
+                timestamp,
+                tz=timezone.utc,
+            ).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    def diagnostics_callback(
+        self,
+        message: DiagnosticArray,
+    ) -> None:
+        diagnostics = {
+            'type': 'diagnostics',
+            'timestamp': self.diagnostic_timestamp(message),
+            'statuses': [
+                {
+                    'name': status.name,
+                    'level': self.diagnostic_level_name(
+                        status.level
+                    ),
+                    'message': status.message,
+                    'hardware_id': status.hardware_id,
+                    'values': [
+                        {
+                            'key': value.key,
+                            'value': value.value,
+                        }
+                        for value in status.values
+                    ],
+                }
+                for status in message.status
+            ],
+        }
+
+        with self.diagnostics_lock:
+            self.latest_diagnostics = diagnostics
+            self.diagnostics_revision += 1
+
     def map_callback(self, message: OccupancyGrid) -> None:
         origin = message.info.origin
         orientation = origin.orientation
@@ -316,6 +421,9 @@ class WebBridgeNode(Node):
                         ),
                         asyncio.create_task(
                             self.map_loop(websocket)
+                        ),
+                        asyncio.create_task(
+                            self.diagnostics_loop(websocket)
                         ),
                     ]
 
@@ -404,6 +512,51 @@ class WebBridgeNode(Node):
                     'type': 'map',
                     'data': map_payload,
                 },
+            )
+            sent_revision = revision
+
+    async def diagnostics_loop(
+        self,
+        websocket: Any,
+    ) -> None:
+        sent_revision = -1
+
+        while not self.stop_requested.is_set():
+            await asyncio.sleep(1.0)
+
+            with self.diagnostics_lock:
+                revision = self.diagnostics_revision
+                diagnostics = (
+                    {
+                        **self.latest_diagnostics,
+                        'statuses': [
+                            {
+                                **status,
+                                'values': [
+                                    dict(value)
+                                    for value
+                                    in status['values']
+                                ],
+                            }
+                            for status
+                            in self.latest_diagnostics[
+                                'statuses'
+                            ]
+                        ],
+                    }
+                    if self.latest_diagnostics is not None
+                    else None
+                )
+
+            if (
+                diagnostics is None
+                or revision == sent_revision
+            ):
+                continue
+
+            await self.send_json(
+                websocket,
+                diagnostics,
             )
             sent_revision = revision
 
