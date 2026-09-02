@@ -13,7 +13,7 @@ from typing import Any
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateToPose
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -38,6 +38,7 @@ class WebBridgeNode(Node):
         self.declare_parameter('reconnect_delay', 3.0)
         self.declare_parameter('pose_topic', '/amcl_pose')
         self.declare_parameter('map_topic', '/map')
+        self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('battery_percent', 100)
         self.declare_parameter(
             'navigate_action',
@@ -65,6 +66,9 @@ class WebBridgeNode(Node):
         self.map_topic = str(
             self.get_parameter('map_topic').value
         )
+        self.odom_topic = str(
+            self.get_parameter('odom_topic').value
+        )
         self.battery_percent = int(
             self.get_parameter('battery_percent').value
         )
@@ -78,9 +82,13 @@ class WebBridgeNode(Node):
         self.stop_requested = threading.Event()
         self.telemetry_lock = threading.Lock()
         self.map_lock = threading.Lock()
+        self.velocity_lock = threading.Lock()
         self.command_lock = threading.Lock()
         self.latest_telemetry: dict[str, Any] | None = None
         self.latest_map: dict[str, Any] | None = None
+        self.latest_velocity: (
+            dict[str, float] | None
+        ) = None
         self.map_revision = 0
         self.command_queue: Queue[
             dict[str, Any]
@@ -122,7 +130,20 @@ class WebBridgeNode(Node):
             self.map_callback,
             self.pose_qos,
         )
-
+        self.odom_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=(
+                ReliabilityPolicy.BEST_EFFORT
+            ),
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.odom_subscription = self.create_subscription(
+            Odometry,
+            self.odom_topic,
+            self.odom_callback,
+            self.odom_qos,
+        )
         self.navigation_client = ActionClient(
             self,
             NavigateToPose,
@@ -151,6 +172,9 @@ class WebBridgeNode(Node):
         self.get_logger().info(f'Map topic: {self.map_topic}')
         self.get_logger().info(
             f'Nav2 action: {self.navigate_action}'
+        )
+        self.get_logger().info(
+            f'Odometry topic: {self.odom_topic}'
         )
 
     @staticmethod
@@ -196,6 +220,35 @@ class WebBridgeNode(Node):
 
         with self.telemetry_lock:
             self.latest_telemetry = telemetry
+
+    def odom_callback(
+        self,
+        message: Odometry,
+    ) -> None:
+        twist = message.twist.twist
+
+        linear_velocity = math.hypot(
+            float(twist.linear.x),
+            float(twist.linear.y),
+        )
+        angular_velocity = float(
+            twist.angular.z
+        )
+
+        if not all(
+            math.isfinite(value)
+            for value in (
+                linear_velocity,
+                angular_velocity,
+            )
+        ):
+            return
+
+        with self.velocity_lock:
+            self.latest_velocity = {
+                'linear_velocity': linear_velocity,
+                'angular_velocity': angular_velocity,
+            }
 
     def map_callback(self, message: OccupancyGrid) -> None:
         origin = message.info.origin
@@ -1112,6 +1165,13 @@ class WebBridgeNode(Node):
             )
             return
 
+        with self.velocity_lock:
+            velocity = (
+                dict(self.latest_velocity)
+                if self.latest_velocity is not None
+                else None
+            )
+
         self.get_logger().debug(
             'Nav2 feedback: '
             f'{distance_remaining:.2f} m remaining, '
@@ -1146,6 +1206,16 @@ class WebBridgeNode(Node):
                 'number_of_recoveries': max(
                     0,
                     int(feedback.number_of_recoveries),
+                ),
+                'linear_velocity': (
+                    velocity['linear_velocity']
+                    if velocity is not None
+                    else None
+                ),
+                'angular_velocity': (
+                    velocity['angular_velocity']
+                    if velocity is not None
+                    else None
                 ),
                 'current_pose': {
                     'frame_id': (
