@@ -857,8 +857,16 @@ class WebBridgeNode(Node):
 
         goal_future = self.navigation_client.send_goal_async(
             goal,
-            feedback_callback=self.navigation_feedback_callback,
+            feedback_callback=(
+                lambda feedback_message: (
+                    self.navigation_feedback_callback(
+                        feedback_message,
+                        command,
+                    )
+                )
+            ),
         )
+
         goal_future.add_done_callback(
             lambda future: self.goal_response_callback(
                 future,
@@ -1015,15 +1023,141 @@ class WebBridgeNode(Node):
                 cancel_request,
             )
 
-    def navigation_feedback_callback(self, feedback: Any) -> None:
+    def navigation_feedback_callback(
+        self,
+        feedback_message: Any,
+        command: dict[str, Any],
+    ) -> None:
         now_ns = self.get_clock().now().nanoseconds
-        if now_ns - self.last_feedback_log_ns < 2_000_000_000:
+
+        if (
+            now_ns - self.last_feedback_log_ns
+            < 2_000_000_000
+        ):
             return
 
         self.last_feedback_log_ns = now_ns
-        distance = feedback.feedback.distance_remaining
+
+        feedback = feedback_message.feedback
+        current_pose = feedback.current_pose
+        pose = current_pose.pose
+        orientation = pose.orientation
+
+        sin_yaw = 2.0 * (
+            orientation.w * orientation.z
+            + orientation.x * orientation.y
+        )
+        cos_yaw = 1.0 - 2.0 * (
+            orientation.y * orientation.y
+            + orientation.z * orientation.z
+        )
+        yaw = math.atan2(
+            sin_yaw,
+            cos_yaw,
+        )
+
+        navigation_duration = (
+            feedback.navigation_time
+        )
+        navigation_time_seconds = (
+            float(navigation_duration.sec)
+            + (
+                float(navigation_duration.nanosec)
+                / 1_000_000_000.0
+            )
+        )
+
+        estimated_duration = (
+            feedback.estimated_time_remaining
+        )
+        estimated_time_remaining_seconds = (
+            float(estimated_duration.sec)
+            + (
+                float(estimated_duration.nanosec)
+                / 1_000_000_000.0
+            )
+        )
+
+        distance_remaining = max(
+            0.0,
+            float(feedback.distance_remaining),
+        )
+        navigation_time_seconds = max(
+            0.0,
+            navigation_time_seconds,
+        )
+        estimated_time_remaining_seconds = max(
+            0.0,
+            estimated_time_remaining_seconds,
+        )
+
+        x = float(pose.position.x)
+        y = float(pose.position.y)
+
+        numeric_values = (
+            distance_remaining,
+            navigation_time_seconds,
+            estimated_time_remaining_seconds,
+            x,
+            y,
+            yaw,
+        )
+
+        if not all(
+            math.isfinite(value)
+            for value in numeric_values
+        ):
+            self.get_logger().warning(
+                'Ignoring non-finite Nav2 feedback'
+            )
+            return
+
         self.get_logger().debug(
-            f'Nav2 distance remaining: {distance:.2f} m'
+            'Nav2 feedback: '
+            f'{distance_remaining:.2f} m remaining, '
+            'ETA '
+            f'{estimated_time_remaining_seconds:.1f} s'
+        )
+
+        self.send_from_ros(
+            {
+                'type': 'navigation_feedback',
+                'command_id': command.get(
+                    'command_id'
+                ),
+                'task_id': command.get(
+                    'task_id'
+                ),
+                'stage': command.get(
+                    'stage'
+                ),
+                'distance_remaining': (
+                    distance_remaining
+                ),
+                'navigation_time_seconds': (
+                    navigation_time_seconds
+                ),
+                (
+                    'estimated_time_'
+                    'remaining_seconds'
+                ): (
+                    estimated_time_remaining_seconds
+                ),
+                'number_of_recoveries': max(
+                    0,
+                    int(feedback.number_of_recoveries),
+                ),
+                'current_pose': {
+                    'frame_id': (
+                        current_pose.header.frame_id
+                        or 'map'
+                    ),
+                    'x': x,
+                    'y': y,
+                    'yaw': yaw,
+                },
+                'timestamp': self.utc_timestamp(),
+            }
         )
 
     def navigation_result_callback(
