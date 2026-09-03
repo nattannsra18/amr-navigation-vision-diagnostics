@@ -1,6 +1,6 @@
 amcl:
   ros__parameters:
-    set_initial_pose: false
+    set_initial_pose: true
     initial_pose:
       x: -2.0
       y: -0.5

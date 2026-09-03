@@ -54,6 +54,10 @@ def generate_launch_description():
         launch_arguments={
             "world": world_file,
             "robot_sdf": robot_sdf,
+            "x_pose": "-2.0",
+            "y_pose": "-0.5",
+            "z_pose": "0.01",
+            "yaw": "0.0",
             "slam": "True",
             "params_file": params_file,
             "use_sim_time": "True",
