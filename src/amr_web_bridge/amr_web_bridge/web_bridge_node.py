@@ -14,7 +14,7 @@ from action_msgs.msg import GoalStatus
 from diagnostic_msgs.msg import DiagnosticArray
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateToPose
-from nav_msgs.msg import OccupancyGrid, Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -25,6 +25,8 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 import websockets
+
+from .path_utils import path_signature, serialize_path
 
 
 class WebBridgeNode(Node):
@@ -41,6 +43,9 @@ class WebBridgeNode(Node):
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('diagnostics_topic', '/diagnostics')
+        self.declare_parameter('path_topic', '/plan')
+        self.declare_parameter('path_max_poses', 500)
+        self.declare_parameter('path_publish_period', 0.5)
         self.declare_parameter('battery_percent', 100)
         self.declare_parameter(
             'navigate_action',
@@ -74,6 +79,22 @@ class WebBridgeNode(Node):
         self.diagnostics_topic = str(
             self.get_parameter('diagnostics_topic').value
         )
+        self.path_topic = str(
+            self.get_parameter('path_topic').value
+        )
+        self.path_max_poses = min(
+            500,
+            max(
+                2,
+                int(self.get_parameter('path_max_poses').value),
+            ),
+        )
+        self.path_publish_period = max(
+            0.1,
+            float(
+                self.get_parameter('path_publish_period').value
+            ),
+        )
         self.battery_percent = int(
             self.get_parameter('battery_percent').value
         )
@@ -90,6 +111,7 @@ class WebBridgeNode(Node):
         self.velocity_lock = threading.Lock()
         self.diagnostics_lock = threading.Lock()
         self.command_lock = threading.Lock()
+        self.path_lock = threading.Lock()
         self.latest_telemetry: dict[str, Any] | None = None
         self.latest_map: dict[str, Any] | None = None
         self.latest_diagnostics: dict[str, Any] | None = None
@@ -115,6 +137,9 @@ class WebBridgeNode(Node):
         ) = None
         self.active_goal_handle: Any = None
         self.last_feedback_log_ns = 0
+        self.latest_path: dict[str, Any] | None = None
+        self.path_revision = 0
+        self.latest_path_signature: tuple[Any, ...] | None = None
 
         self.asyncio_loop: asyncio.AbstractEventLoop | None = None
         self.send_lock: asyncio.Lock | None = None
@@ -164,6 +189,18 @@ class WebBridgeNode(Node):
             self.diagnostics_callback,
             self.diagnostics_qos,
         )
+        self.path_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.path_subscription = self.create_subscription(
+            Path,
+            self.path_topic,
+            self.path_callback,
+            self.path_qos,
+        )
         self.navigation_client = ActionClient(
             self,
             NavigateToPose,
@@ -198,6 +235,9 @@ class WebBridgeNode(Node):
         )
         self.get_logger().info(
             f'Diagnostics topic: {self.diagnostics_topic}'
+        )
+        self.get_logger().info(
+            f'Nav2 global path topic: {self.path_topic}'
         )
 
     @staticmethod
@@ -393,6 +433,61 @@ class WebBridgeNode(Node):
             f'{message.info.width}x{message.info.height}'
         )
 
+    @staticmethod
+    def message_timestamp(message: Any) -> str:
+        stamp = message.header.stamp
+        try:
+            seconds = (
+                float(stamp.sec)
+                + float(stamp.nanosec) / 1_000_000_000.0
+            )
+            if math.isfinite(seconds) and seconds >= 0.0:
+                return datetime.fromtimestamp(
+                    seconds,
+                    tz=timezone.utc,
+                ).isoformat()
+        except (OverflowError, OSError, ValueError):
+            pass
+        return WebBridgeNode.utc_timestamp()
+
+    def path_callback(self, message: Path) -> None:
+        with self.command_lock:
+            command = (
+                dict(self.active_command)
+                if self.active_command is not None
+                else None
+            )
+
+        path = serialize_path(
+            message,
+            command,
+            self.path_max_poses,
+            self.message_timestamp(message),
+        )
+        if path is None:
+            if command is not None:
+                self.clear_navigation_path(
+                    command,
+                    force=False,
+                )
+            return
+
+        with self.command_lock:
+            if (
+                self.active_command is None
+                or self.active_command.get('command_id')
+                != path['command_id']
+            ):
+                return
+
+        signature = path_signature(path)
+        with self.path_lock:
+            if signature == self.latest_path_signature:
+                return
+            self.latest_path = path
+            self.latest_path_signature = signature
+            self.path_revision += 1
+
     async def connection_supervisor(self) -> None:
         self.asyncio_loop = asyncio.get_running_loop()
 
@@ -425,6 +520,9 @@ class WebBridgeNode(Node):
                         asyncio.create_task(
                             self.diagnostics_loop(websocket)
                         ),
+                        asyncio.create_task(
+                            self.path_loop(websocket)
+                        ),
                     ]
 
                     try:
@@ -444,6 +542,7 @@ class WebBridgeNode(Node):
                         f'WebSocket disconnected: {error}'
                     )
             finally:
+                self.clear_navigation_path(send_clear=False)
                 self.websocket = None
                 self.send_lock = None
 
@@ -558,6 +657,29 @@ class WebBridgeNode(Node):
                 websocket,
                 diagnostics,
             )
+            sent_revision = revision
+
+    async def path_loop(self, websocket: Any) -> None:
+        sent_revision = -1
+        while not self.stop_requested.is_set():
+            await asyncio.sleep(self.path_publish_period)
+            with self.path_lock:
+                revision = self.path_revision
+                path = (
+                    {
+                        **self.latest_path,
+                        'poses': [
+                            dict(pose)
+                            for pose in self.latest_path['poses']
+                        ],
+                    }
+                    if self.latest_path is not None
+                    else None
+                )
+
+            if path is None or revision == sent_revision:
+                continue
+            await self.send_json(websocket, path)
             sent_revision = revision
 
     async def send_json(
@@ -1032,6 +1154,8 @@ class WebBridgeNode(Node):
                 )
             else:
                 self.active_command = command
+
+        self.clear_navigation_path(send_clear=False)
 
         if skip_cancelled_command:
             self.get_logger().info(
@@ -1588,14 +1712,58 @@ class WebBridgeNode(Node):
         )
 
     def clear_active_command(self, command_id: str) -> None:
+        cleared_command = None
         with self.command_lock:
             if (
                 self.active_command is not None
                 and self.active_command.get('command_id')
                 == command_id
             ):
+                cleared_command = dict(self.active_command)
                 self.active_command = None
                 self.active_goal_handle = None
+
+        if cleared_command is not None:
+            self.clear_navigation_path(
+                cleared_command,
+                send_clear=False,
+                force=True,
+            )
+
+    def clear_navigation_path(
+        self,
+        command: dict[str, Any] | None = None,
+        *,
+        send_clear: bool = True,
+        force: bool = False,
+    ) -> None:
+        if command is None:
+            with self.command_lock:
+                command = (
+                    dict(self.active_command)
+                    if self.active_command is not None
+                    else None
+                )
+
+        with self.path_lock:
+            had_path = self.latest_path is not None
+            self.latest_path = None
+            self.latest_path_signature = None
+            self.path_revision += 1
+
+        if (
+            send_clear
+            and command is not None
+            and (had_path or force)
+        ):
+            self.send_from_ros(
+                {
+                    'type': 'navigation_path_clear',
+                    'command_id': command.get('command_id'),
+                    'task_id': command.get('task_id'),
+                    'stage': command.get('stage'),
+                }
+            )
 
     def destroy_node(self) -> bool:
         self.stop_requested.set()
