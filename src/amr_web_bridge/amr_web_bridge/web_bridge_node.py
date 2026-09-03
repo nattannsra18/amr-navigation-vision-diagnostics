@@ -6,13 +6,14 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import math
+import os
 from queue import Empty, Queue
 import threading
 from typing import Any
 
 from action_msgs.msg import GoalStatus
 from diagnostic_msgs.msg import DiagnosticArray
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 import rclpy
@@ -51,6 +52,9 @@ class WebBridgeNode(Node):
             'navigate_action',
             '/navigate_to_pose',
         )
+        self.declare_parameter('robot_ws_token', '')
+        self.declare_parameter('emergency_stop_cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('emergency_stop_zero_rate', 10.0)
 
         self.server_url = str(
             self.get_parameter('server_url').value
@@ -101,6 +105,28 @@ class WebBridgeNode(Node):
         self.navigate_action = str(
             self.get_parameter('navigate_action').value
         )
+        parameter_token = str(
+            self.get_parameter('robot_ws_token').value
+        )
+        self.robot_ws_token = os.getenv(
+            'ROBOT_WS_TOKEN', parameter_token
+        )
+        self.emergency_stop_cmd_vel_topic = str(
+            self.get_parameter(
+                'emergency_stop_cmd_vel_topic'
+            ).value
+        )
+        self.emergency_stop_zero_rate = min(
+            20.0,
+            max(
+                5.0,
+                float(
+                    self.get_parameter(
+                        'emergency_stop_zero_rate'
+                    ).value
+                ),
+            ),
+        )
         self.websocket_uri = (
             f'{self.server_url}/ws/robots/{self.robot_id}'
         )
@@ -112,6 +138,8 @@ class WebBridgeNode(Node):
         self.diagnostics_lock = threading.Lock()
         self.command_lock = threading.Lock()
         self.path_lock = threading.Lock()
+        self.emergency_stop_latched = threading.Event()
+        self.last_emergency_command_id: str | None = None
         self.latest_telemetry: dict[str, Any] | None = None
         self.latest_map: dict[str, Any] | None = None
         self.latest_diagnostics: dict[str, Any] | None = None
@@ -209,6 +237,15 @@ class WebBridgeNode(Node):
         self.command_timer = self.create_timer(
             0.1,
             self.process_command_queue,
+        )
+        self.emergency_velocity_publisher = self.create_publisher(
+            Twist,
+            self.emergency_stop_cmd_vel_topic,
+            10,
+        )
+        self.emergency_zero_timer = self.create_timer(
+            1.0 / self.emergency_stop_zero_rate,
+            self.publish_emergency_zero,
         )
 
         self.worker_thread = threading.Thread(
@@ -497,6 +534,15 @@ class WebBridgeNode(Node):
 
                 async with websockets.connect(
                     self.websocket_uri,
+                    extra_headers=(
+                        {
+                            'Authorization': (
+                                f'Bearer {self.robot_ws_token}'
+                            )
+                        }
+                        if self.robot_ws_token
+                        else None
+                    ),
                     open_timeout=5,
                     ping_interval=20,
                     ping_timeout=20,
@@ -776,6 +822,11 @@ class WebBridgeNode(Node):
                 websocket,
                 message,
             )
+        elif message_type == 'emergency_command':
+            await self.handle_emergency_command(
+                websocket,
+                message,
+            )
         elif message_type == 'command_ack_received':
             self.get_logger().info(
                 'FastAPI received command acknowledgement'
@@ -845,6 +896,97 @@ class WebBridgeNode(Node):
             f'{cancel_id}'
         )
 
+    async def handle_emergency_command(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+    ) -> None:
+        command_id = message.get('command_id')
+        command = message.get('command')
+        valid = (
+            isinstance(command_id, str)
+            and bool(command_id)
+            and command in {
+                'emergency_stop',
+                'emergency_stop_reset',
+            }
+        )
+        if not valid:
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'emergency_ack',
+                    'command_id': command_id,
+                    'command': command,
+                    'accepted': False,
+                    'detail': 'Invalid Emergency Stop command',
+                },
+            )
+            return
+
+        if command == 'emergency_stop':
+            self.emergency_stop_latched.set()
+            self.last_emergency_command_id = command_id
+            self.clear_command_queue()
+            self.clear_navigation_path(
+                send_clear=True,
+                force=True,
+            )
+            self.publish_emergency_zero()
+            with self.command_lock:
+                goal_handle = self.active_goal_handle
+                self.active_command = None
+                self.active_goal_handle = None
+                self.pending_command_ids.clear()
+                self.pending_cancel_requests.clear()
+            if goal_handle is not None:
+                try:
+                    goal_handle.cancel_goal_async()
+                except Exception as error:
+                    self.get_logger().error(
+                        'Emergency Nav2 cancellation request failed: '
+                        f'{error}'
+                    )
+            detail = (
+                'Emergency Stop latched; navigation cleared '
+                'and zero velocity enforced'
+            )
+        else:
+            self.emergency_stop_latched.clear()
+            self.last_emergency_command_id = command_id
+            self.publish_zero_velocity()
+            detail = (
+                'Emergency Stop reset; previous navigation '
+                'will not be resumed'
+            )
+
+        await self.send_json(
+            websocket,
+            {
+                'type': 'emergency_ack',
+                'command_id': command_id,
+                'command': command,
+                'accepted': True,
+                'detail': detail,
+            },
+        )
+
+    def clear_command_queue(self) -> None:
+        while True:
+            try:
+                self.command_queue.get_nowait()
+            except Empty:
+                break
+        with self.command_lock:
+            self.pending_command_ids.clear()
+
+    def publish_zero_velocity(self) -> None:
+        self.emergency_velocity_publisher.publish(Twist())
+
+    def publish_emergency_zero(self) -> None:
+        if self.emergency_stop_latched.is_set():
+            self.publish_zero_velocity()
+
     async def queue_navigation_command(
         self,
         websocket: Any,
@@ -855,6 +997,18 @@ class WebBridgeNode(Node):
         task_id = message.get('task_id')
         stage = message.get('stage')
         target = message.get('target')
+
+        if self.emergency_stop_latched.is_set():
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'command_ack',
+                    'command_id': command_id,
+                    'accepted': False,
+                    'detail': 'Emergency Stop is latched',
+                },
+            )
+            return
 
         valid_target = (
             isinstance(target, dict)
@@ -1122,6 +1276,10 @@ class WebBridgeNode(Node):
         # Cancellation always takes priority over
         # starting another navigation command.
         if self.process_cancel_queue():
+            return
+
+        if self.emergency_stop_latched.is_set():
+            self.clear_command_queue()
             return
 
         with self.command_lock:
@@ -1767,6 +1925,11 @@ class WebBridgeNode(Node):
 
     def destroy_node(self) -> bool:
         self.stop_requested.set()
+        self.emergency_stop_latched.clear()
+        self.destroy_timer(self.emergency_zero_timer)
+        self.destroy_publisher(
+            self.emergency_velocity_publisher
+        )
 
         if self.asyncio_loop is not None and self.websocket is not None:
             try:

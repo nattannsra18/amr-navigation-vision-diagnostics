@@ -243,6 +243,29 @@ source install/setup.bash
 
 ## Run
 
+### Authenticated web bridge and software Emergency Stop
+
+Set the same random robot credential configured in FastAPI without placing it
+on a command line or URL:
+
+```bash
+export ROBOT_WS_TOKEN='<same-random-token-as-backend>'
+ros2 run amr_web_bridge web_bridge_node --ros-args \
+  -p server_url:=ws://localhost:8000 \
+  -p robot_id:=robot01 \
+  -p emergency_stop_cmd_vel_topic:=/cmd_vel \
+  -p emergency_stop_zero_rate:=10.0
+```
+
+The bridge sends the credential as an Authorization bearer header and does not
+log it. `/cmd_vel` is the final simulation command topic (the velocity smoother
+outputs there and the Gazebo drive plugin consumes it). While latched, the
+bridge cancels Nav2 asynchronously, drops queued navigation, rejects new goals,
+and publishes zero `Twist` at 10 Hz. Reset never replays the interrupted goal.
+
+> THIS SOFTWARE EMERGENCY STOP IS NOT A SUBSTITUTE FOR A CERTIFIED PHYSICAL
+> EMERGENCY STOP CIRCUIT.
+
 ### Saved-map navigation, vision, and diagnostics
 
 This is the main end-to-end launch:
