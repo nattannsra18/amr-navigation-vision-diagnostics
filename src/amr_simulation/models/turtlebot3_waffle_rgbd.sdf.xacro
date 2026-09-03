@@ -434,6 +434,12 @@
         <pose>0.0 0.0 0.010 0 0 0</pose>
       </joint>
 
+      <joint name="imu_joint" type="fixed">
+        <parent>base_link</parent>
+        <child>imu_link</child>
+        <pose>0.0 0.0 0.068 0 0 0</pose>
+      </joint>
+
       <joint name="wheel_left_joint" type="revolute">
         <parent>base_link</parent>
         <child>wheel_left_link</child>
