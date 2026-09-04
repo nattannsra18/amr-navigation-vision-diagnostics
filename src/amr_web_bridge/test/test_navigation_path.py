@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from amr_web_bridge.path_utils import (
     downsample_preserving_endpoints,
     serialize_path,
+    serialize_preview_path,
 )
 from amr_web_bridge.web_bridge_node import WebBridgeNode
 
@@ -80,6 +81,20 @@ def test_no_path_is_serialized_without_active_command():
         500,
         '2026-09-03T10:00:00+00:00',
     ) is None
+
+
+def test_preview_path_serialization_needs_no_navigation_command():
+    serialized = serialize_preview_path(
+        path([pose(0.0, 0.0), pose(3.0, 4.0)]),
+        500,
+    )
+    assert serialized == (
+        'map',
+        [
+            {'x': 0.0, 'y': 0.0, 'yaw': 0.0},
+            {'x': 3.0, 'y': 4.0, 'yaw': 0.0},
+        ],
+    )
 
 
 def make_bridge(command=None):

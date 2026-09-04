@@ -88,6 +88,32 @@ def serialize_path(
     }
 
 
+def serialize_preview_path(
+    message: Any,
+    maximum: int,
+) -> tuple[str, list[dict[str, float]]] | None:
+    """Serialize a planner result without active-navigation metadata."""
+    poses: list[dict[str, float]] = []
+    for stamped_pose in message.poses:
+        pose = stamped_pose.pose
+        x = float(pose.position.x)
+        y = float(pose.position.y)
+        if not math.isfinite(x) or not math.isfinite(y):
+            continue
+        serialized_pose = {'x': x, 'y': y}
+        yaw = quaternion_yaw(pose.orientation)
+        if yaw is not None:
+            serialized_pose['yaw'] = yaw
+        poses.append(serialized_pose)
+
+    if not poses:
+        return None
+    return (
+        message.header.frame_id or 'map',
+        downsample_preserving_endpoints(poses, maximum),
+    )
+
+
 def path_signature(path: dict[str, Any]) -> tuple[Any, ...]:
     return (
         path['command_id'],

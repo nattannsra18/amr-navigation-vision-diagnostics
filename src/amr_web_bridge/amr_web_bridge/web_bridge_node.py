@@ -14,7 +14,7 @@ from typing import Any
 from action_msgs.msg import GoalStatus
 from diagnostic_msgs.msg import DiagnosticArray
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import ComputePathToPose, NavigateToPose
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 import rclpy
 from rclpy.action import ActionClient
@@ -27,7 +27,11 @@ from rclpy.qos import (
 )
 import websockets
 
-from .path_utils import path_signature, serialize_path
+from .path_utils import (
+    path_signature,
+    serialize_path,
+    serialize_preview_path,
+)
 
 
 class WebBridgeNode(Node):
@@ -51,6 +55,10 @@ class WebBridgeNode(Node):
         self.declare_parameter(
             'navigate_action',
             '/navigate_to_pose',
+        )
+        self.declare_parameter(
+            'compute_path_action',
+            '/compute_path_to_pose',
         )
         self.declare_parameter('robot_ws_token', '')
         self.declare_parameter('emergency_stop_cmd_vel_topic', '/cmd_vel')
@@ -105,6 +113,9 @@ class WebBridgeNode(Node):
         self.navigate_action = str(
             self.get_parameter('navigate_action').value
         )
+        self.compute_path_action = str(
+            self.get_parameter('compute_path_action').value
+        )
         parameter_token = str(
             self.get_parameter('robot_ws_token').value
         )
@@ -138,6 +149,7 @@ class WebBridgeNode(Node):
         self.diagnostics_lock = threading.Lock()
         self.command_lock = threading.Lock()
         self.path_lock = threading.Lock()
+        self.preview_lock = threading.Lock()
         self.emergency_stop_latched = threading.Event()
         self.last_emergency_command_id: str | None = None
         self.latest_telemetry: dict[str, Any] | None = None
@@ -168,6 +180,8 @@ class WebBridgeNode(Node):
         self.latest_path: dict[str, Any] | None = None
         self.path_revision = 0
         self.latest_path_signature: tuple[Any, ...] | None = None
+        self.preview_queue: Queue[dict[str, Any]] = Queue()
+        self.active_preview: dict[str, Any] | None = None
 
         self.asyncio_loop: asyncio.AbstractEventLoop | None = None
         self.send_lock: asyncio.Lock | None = None
@@ -234,9 +248,18 @@ class WebBridgeNode(Node):
             NavigateToPose,
             self.navigate_action,
         )
+        self.preview_client = ActionClient(
+            self,
+            ComputePathToPose,
+            self.compute_path_action,
+        )
         self.command_timer = self.create_timer(
             0.1,
             self.process_command_queue,
+        )
+        self.preview_timer = self.create_timer(
+            0.1,
+            self.process_preview_queue,
         )
         self.emergency_velocity_publisher = self.create_publisher(
             Twist,
@@ -266,6 +289,9 @@ class WebBridgeNode(Node):
         self.get_logger().info(f'Map topic: {self.map_topic}')
         self.get_logger().info(
             f'Nav2 action: {self.navigate_action}'
+        )
+        self.get_logger().info(
+            f'Nav2 preview action: {self.compute_path_action}'
         )
         self.get_logger().info(
             f'Odometry topic: {self.odom_topic}'
@@ -817,6 +843,8 @@ class WebBridgeNode(Node):
                 websocket,
                 message,
             )
+        elif message_type == 'route_preview_request':
+            await self.queue_route_preview(websocket, message)
         elif message_type == 'cancel_navigation':
             await self.queue_navigation_cancel(
                 websocket,
@@ -854,6 +882,57 @@ class WebBridgeNode(Node):
             self.get_logger().debug(
                 f'Unhandled WebSocket message: {message_type}'
             )
+
+    async def queue_route_preview(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+    ) -> None:
+        request_id = message.get('request_id')
+
+        def valid_pose(value: Any) -> bool:
+            return (
+                isinstance(value, dict)
+                and isinstance(value.get('frame_id'), str)
+                and bool(value.get('frame_id'))
+                and all(
+                    isinstance(value.get(key), (int, float))
+                    and not isinstance(value.get(key), bool)
+                    and math.isfinite(float(value[key]))
+                    for key in ('x', 'y', 'yaw')
+                )
+            )
+
+        valid = (
+            isinstance(request_id, str)
+            and bool(request_id)
+            and len(request_id) <= 100
+            and valid_pose(message.get('start'))
+            and valid_pose(message.get('pickup'))
+            and valid_pose(message.get('destination'))
+        )
+        if not valid:
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'route_preview_result',
+                    'request_id': (
+                        request_id
+                        if isinstance(request_id, str)
+                        else ''
+                    ),
+                    'status': 'unavailable',
+                    'detail': 'Invalid route preview request',
+                    'pickup_path': [],
+                    'delivery_path': [],
+                },
+            )
+            return
+
+        self.preview_queue.put(message)
+        self.get_logger().info(
+            f'Queued Nav2 route preview {request_id}'
+        )
 
     async def queue_navigation_cancel(
         self,
@@ -1270,6 +1349,234 @@ class WebBridgeNode(Node):
         self.get_logger().info(
             'Nav2 accepted cancellation request '
             f'{cancel_id}; waiting for final result'
+        )
+
+    def process_preview_queue(self) -> None:
+        with self.preview_lock:
+            if self.active_preview is not None:
+                return
+
+        try:
+            request = self.preview_queue.get_nowait()
+        except Empty:
+            return
+
+        state = {
+            'request': request,
+            'pickup_path': None,
+            'frame_id': None,
+        }
+        with self.preview_lock:
+            self.active_preview = state
+
+        if not self.preview_client.wait_for_server(timeout_sec=1.0):
+            self.finish_route_preview(
+                request,
+                'unavailable',
+                'Nav2 ComputePathToPose server is unavailable',
+            )
+            return
+
+        self.send_preview_leg(
+            state,
+            'pickup',
+            request['start'],
+            request['pickup'],
+        )
+
+    def build_preview_goal(
+        self,
+        start: dict[str, Any],
+        target: dict[str, Any],
+        *,
+        use_start: bool,
+    ) -> ComputePathToPose.Goal:
+        goal = ComputePathToPose.Goal()
+        stamp = self.get_clock().now().to_msg()
+        goal.start.header.stamp = stamp
+        goal.start.header.frame_id = str(start['frame_id'])
+        goal.start.pose.position.x = float(start['x'])
+        goal.start.pose.position.y = float(start['y'])
+        goal.start.pose.orientation.z = math.sin(float(start['yaw']) / 2.0)
+        goal.start.pose.orientation.w = math.cos(float(start['yaw']) / 2.0)
+        goal.goal.header.stamp = stamp
+        goal.goal.header.frame_id = str(target['frame_id'])
+        goal.goal.pose.position.x = float(target['x'])
+        goal.goal.pose.position.y = float(target['y'])
+        goal.goal.pose.orientation.z = math.sin(float(target['yaw']) / 2.0)
+        goal.goal.pose.orientation.w = math.cos(float(target['yaw']) / 2.0)
+        goal.planner_id = ''
+        goal.use_start = use_start
+        return goal
+
+    def send_preview_leg(
+        self,
+        state: dict[str, Any],
+        leg: str,
+        start: dict[str, Any],
+        target: dict[str, Any],
+    ) -> None:
+        request = state['request']
+        future = self.preview_client.send_goal_async(
+            self.build_preview_goal(
+                start,
+                target,
+                use_start=leg != 'pickup',
+            )
+        )
+        future.add_done_callback(
+            lambda response: self.preview_goal_response(
+                response,
+                state,
+                leg,
+            )
+        )
+        self.get_logger().info(
+            'Requesting Nav2 route preview '
+            f"{request['request_id']} ({leg})"
+        )
+
+    def preview_goal_response(
+        self,
+        future: Any,
+        state: dict[str, Any],
+        leg: str,
+    ) -> None:
+        request = state['request']
+        try:
+            goal_handle = future.result()
+        except Exception as error:
+            self.finish_route_preview(
+                request,
+                'unavailable',
+                f'Failed to request Nav2 route preview: {error}',
+            )
+            return
+
+        if not goal_handle.accepted:
+            self.finish_route_preview(
+                request,
+                'unavailable',
+                'Nav2 rejected the route preview request',
+            )
+            return
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(
+            lambda result: self.preview_result_callback(
+                result,
+                state,
+                leg,
+            )
+        )
+
+    def preview_result_callback(
+        self,
+        future: Any,
+        state: dict[str, Any],
+        leg: str,
+    ) -> None:
+        request = state['request']
+        try:
+            wrapped = future.result()
+            result = wrapped.result
+        except Exception as error:
+            self.finish_route_preview(
+                request,
+                'unavailable',
+                f'Failed to receive Nav2 route preview: {error}',
+            )
+            return
+
+        error_code = int(getattr(result, 'error_code', 0))
+        if (
+            wrapped.status != GoalStatus.STATUS_SUCCEEDED
+            or error_code != 0
+        ):
+            detail = getattr(result, 'error_msg', '') or (
+                f'Nav2 could not compute the {leg} route'
+            )
+            self.finish_route_preview(
+                request,
+                'unreachable',
+                str(detail),
+            )
+            return
+
+        serialized = serialize_preview_path(
+            result.path,
+            self.path_max_poses,
+        )
+        if serialized is None:
+            self.finish_route_preview(
+                request,
+                'unreachable',
+                f'Nav2 returned no {leg} path',
+            )
+            return
+
+        frame_id, poses = serialized
+        if leg == 'pickup':
+            state['pickup_path'] = poses
+            state['frame_id'] = frame_id
+            self.send_preview_leg(
+                state,
+                'destination',
+                request['pickup'],
+                request['destination'],
+            )
+            return
+
+        if state.get('frame_id') != frame_id:
+            self.finish_route_preview(
+                request,
+                'unavailable',
+                'Nav2 preview paths use incompatible frames',
+            )
+            return
+
+        self.finish_route_preview(
+            request,
+            'available',
+            'Both route segments are reachable',
+            frame_id=frame_id,
+            pickup_path=state['pickup_path'],
+            delivery_path=poses,
+        )
+
+    def finish_route_preview(
+        self,
+        request: dict[str, Any],
+        status: str,
+        detail: str,
+        *,
+        frame_id: str | None = None,
+        pickup_path: list[dict[str, float]] | None = None,
+        delivery_path: list[dict[str, float]] | None = None,
+    ) -> None:
+        request_id = str(request.get('request_id', ''))
+        with self.preview_lock:
+            active = self.active_preview
+            if (
+                active is None
+                or active['request'].get('request_id') != request_id
+            ):
+                return
+            self.active_preview = None
+
+        self.send_from_ros(
+            {
+                'type': 'route_preview_result',
+                'request_id': request_id,
+                'status': status,
+                'frame_id': frame_id,
+                'pickup_path': pickup_path or [],
+                'delivery_path': delivery_path or [],
+                'detail': detail,
+            }
+        )
+        self.get_logger().info(
+            f'Nav2 route preview {request_id}: {status}'
         )
 
     def process_command_queue(self) -> None:
@@ -1926,6 +2233,7 @@ class WebBridgeNode(Node):
     def destroy_node(self) -> bool:
         self.stop_requested.set()
         self.emergency_stop_latched.clear()
+        self.destroy_timer(self.preview_timer)
         self.destroy_timer(self.emergency_zero_timer)
         self.destroy_publisher(
             self.emergency_velocity_publisher

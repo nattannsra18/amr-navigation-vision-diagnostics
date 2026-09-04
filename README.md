@@ -263,6 +263,11 @@ outputs there and the Gazebo drive plugin consumes it). While latched, the
 bridge cancels Nav2 asynchronously, drops queued navigation, rejects new goals,
 and publishes zero `Twist` at 10 Hz. Reset never replays the interrupted goal.
 
+Delivery previews use Nav2's `/compute_path_to_pose` action twice (robot to
+pickup and pickup to destination). The bridge returns the bounded planner paths
+to FastAPI for reachability, distance, and ETA validation without sending a
+`/navigate_to_pose` goal or moving the robot.
+
 > THIS SOFTWARE EMERGENCY STOP IS NOT A SUBSTITUTE FOR A CERTIFIED PHYSICAL
 > EMERGENCY STOP CIRCUIT.
 
