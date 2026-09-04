@@ -1,10 +1,11 @@
 from launch import LaunchDescription
 from launch.actions import (
     AppendEnvironmentVariable,
+    DeclareLaunchArgument,
     IncludeLaunchDescription,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
@@ -55,6 +56,13 @@ def generate_launch_description():
         "models",
     ])
 
+    headless = LaunchConfiguration("headless")
+    declare_headless = DeclareLaunchArgument(
+        "headless",
+        default_value="False",
+        description="Run Gazebo without its GUI",
+    )
+
     set_gz_resource_path = AppendEnvironmentVariable(
         "GZ_SIM_RESOURCE_PATH",
         models_path,
@@ -74,7 +82,7 @@ def generate_launch_description():
             "params_file": params_file,
             "use_sim_time": "True",
             "autostart": "True",
-            "headless": "False",
+            "headless": headless,
         }.items(),
     )
 
@@ -100,6 +108,7 @@ def generate_launch_description():
         }],
     )
     return LaunchDescription([
+        declare_headless,
         set_gz_resource_path,
         navigation,
         diagnostics,
