@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import find_packages, setup
 
 
@@ -18,6 +20,10 @@ setup(
         (
             'share/' + package_name,
             ['package.xml'],
+        ),
+        (
+            'share/' + package_name + '/config',
+            glob('config/*.yaml'),
         ),
     ],
     install_requires=[

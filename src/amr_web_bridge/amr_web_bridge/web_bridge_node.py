@@ -9,9 +9,11 @@ import math
 import os
 from queue import Empty, Queue
 import threading
+import time
 from typing import Any
 
 from action_msgs.msg import GoalStatus
+from ament_index_python.packages import get_package_share_directory
 from diagnostic_msgs.msg import DiagnosticArray
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import ComputePathToPose, NavigateToPose
@@ -26,6 +28,8 @@ from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy,
 )
+from rclpy.time import Time
+from tf2_ros import Buffer, TransformListener
 import websockets
 
 from .map_catalog import (
@@ -36,6 +40,7 @@ from .map_catalog import (
     rename_map,
     update_map_metadata,
 )
+from .mapping_runtime import MappingRuntime
 from .path_utils import (
     path_signature,
     serialize_path,
@@ -82,6 +87,8 @@ class WebBridgeNode(Node):
         self.declare_parameter('robot_ws_token', '')
         self.declare_parameter('emergency_stop_cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('emergency_stop_zero_rate', 10.0)
+        self.declare_parameter('mapping_teleop_deadman_seconds', 0.35)
+        self.declare_parameter('initial_pose_topic', '/initialpose')
 
         self.server_url = str(
             self.get_parameter('server_url').value
@@ -170,6 +177,13 @@ class WebBridgeNode(Node):
                 ),
             ),
         )
+        self.mapping_teleop_deadman_seconds = min(
+            1.0,
+            max(0.15, float(self.get_parameter('mapping_teleop_deadman_seconds').value)),
+        )
+        self.initial_pose_topic = str(
+            self.get_parameter('initial_pose_topic').value
+        )
         self.websocket_uri = (
             f'{self.server_url}/ws/robots/{self.robot_id}'
         )
@@ -183,6 +197,7 @@ class WebBridgeNode(Node):
         self.path_lock = threading.Lock()
         self.preview_lock = threading.Lock()
         self.map_command_lock = threading.Lock()
+        self.mapping_velocity_lock = threading.Lock()
         self.emergency_stop_latched = threading.Event()
         self.last_emergency_command_id: str | None = None
         self.latest_telemetry: dict[str, Any] | None = None
@@ -217,6 +232,23 @@ class WebBridgeNode(Node):
         self.active_preview: dict[str, Any] | None = None
         self.map_command_queue: Queue[dict[str, Any]] = Queue()
         self.active_map_command: dict[str, Any] | None = None
+        mapping_params_file = os.path.join(
+            get_package_share_directory('amr_web_bridge'),
+            'config',
+            'web_mapping.yaml',
+        )
+        self.mapping_runtime = MappingRuntime(
+            self.maps_directory,
+            slam_params_file=mapping_params_file,
+        )
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.mapping_velocity_deadline = 0.0
+        self.mapping_velocity_active = False
+        self.mapping_pose_reference: tuple[
+            tuple[float, float, float],
+            tuple[float, float, float],
+        ] | None = None
 
         self.asyncio_loop: asyncio.AbstractEventLoop | None = None
         self.send_lock: asyncio.Lock | None = None
@@ -309,9 +341,22 @@ class WebBridgeNode(Node):
             self.emergency_stop_cmd_vel_topic,
             10,
         )
+        self.initial_pose_publisher = self.create_publisher(
+            PoseWithCovarianceStamped,
+            self.initial_pose_topic,
+            10,
+        )
         self.emergency_zero_timer = self.create_timer(
             1.0 / self.emergency_stop_zero_rate,
             self.publish_emergency_zero,
+        )
+        self.mapping_deadman_timer = self.create_timer(
+            0.05,
+            self.enforce_mapping_deadman,
+        )
+        self.mapping_pose_timer = self.create_timer(
+            0.2,
+            self.update_mapping_pose,
         )
 
         self.worker_thread = threading.Thread(
@@ -427,6 +472,123 @@ class WebBridgeNode(Node):
                 'linear_velocity': linear_velocity,
                 'angular_velocity': angular_velocity,
             }
+
+    def update_mapping_pose(self) -> None:
+        snapshot = self.mapping_runtime.snapshot(self.map_revision)
+        if snapshot.get('phase') not in {'MAPPING', 'STOPPING', 'REVIEW'}:
+            return
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'map',
+                'base_footprint',
+                Time(),
+            )
+        except Exception:
+            return
+
+        translation = transform.transform.translation
+        orientation = transform.transform.rotation
+        sin_yaw = 2.0 * (
+            orientation.w * orientation.z
+            + orientation.x * orientation.y
+        )
+        cos_yaw = 1.0 - 2.0 * (
+            orientation.y * orientation.y
+            + orientation.z * orientation.z
+        )
+        telemetry = {
+            'x': float(translation.x),
+            'y': float(translation.y),
+            'yaw': float(math.atan2(sin_yaw, cos_yaw)),
+            'battery': self.battery_percent,
+            'battery_source': 'SIMULATED',
+            'frame_id': 'map',
+            'timestamp': self.utc_timestamp(),
+        }
+        with self.telemetry_lock:
+            self.latest_telemetry = telemetry
+
+    def lookup_planar_pose(
+        self,
+        target_frame: str,
+        source_frame: str,
+    ) -> tuple[float, float, float]:
+        transform = self.tf_buffer.lookup_transform(
+            target_frame,
+            source_frame,
+            Time(),
+        ).transform
+        orientation = transform.rotation
+        sin_yaw = 2.0 * (
+            orientation.w * orientation.z
+            + orientation.x * orientation.y
+        )
+        cos_yaw = 1.0 - 2.0 * (
+            orientation.y * orientation.y
+            + orientation.z * orientation.z
+        )
+        return (
+            float(transform.translation.x),
+            float(transform.translation.y),
+            float(math.atan2(sin_yaw, cos_yaw)),
+        )
+
+    def capture_mapping_pose_reference(self) -> None:
+        try:
+            self.mapping_pose_reference = (
+                self.lookup_planar_pose('map', 'base_footprint'),
+                self.lookup_planar_pose('odom', 'base_footprint'),
+            )
+        except Exception:
+            self.mapping_pose_reference = None
+
+    def restore_mapping_pose_estimate(self) -> None:
+        reference = self.mapping_pose_reference
+        self.mapping_pose_reference = None
+        if reference is None:
+            return
+        try:
+            (map_x, map_y, map_yaw), (
+                odom_x0, odom_y0, odom_yaw0,
+            ) = reference
+            odom_x1, odom_y1, odom_yaw1 = self.lookup_planar_pose(
+                'odom', 'base_footprint'
+            )
+        except Exception:
+            return
+
+        odom_dx = odom_x1 - odom_x0
+        odom_dy = odom_y1 - odom_y0
+        delta_x = (
+            math.cos(odom_yaw0) * odom_dx
+            + math.sin(odom_yaw0) * odom_dy
+        )
+        delta_y = (
+            -math.sin(odom_yaw0) * odom_dx
+            + math.cos(odom_yaw0) * odom_dy
+        )
+        pose_x = (
+            map_x + math.cos(map_yaw) * delta_x
+            - math.sin(map_yaw) * delta_y
+        )
+        pose_y = (
+            map_y + math.sin(map_yaw) * delta_x
+            + math.cos(map_yaw) * delta_y
+        )
+        pose_yaw = map_yaw + odom_yaw1 - odom_yaw0
+
+        message = PoseWithCovarianceStamped()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = 'map'
+        message.pose.pose.position.x = pose_x
+        message.pose.pose.position.y = pose_y
+        message.pose.pose.orientation.z = math.sin(pose_yaw / 2.0)
+        message.pose.pose.orientation.w = math.cos(pose_yaw / 2.0)
+        message.pose.covariance[0] = 0.25
+        message.pose.covariance[7] = 0.25
+        message.pose.covariance[35] = 0.0685
+        self.initial_pose_publisher.publish(message)
 
     @staticmethod
     def normalize_diagnostic_level(level: Any) -> int | None:
@@ -650,6 +812,9 @@ class WebBridgeNode(Node):
                         asyncio.create_task(
                             self.path_loop(websocket)
                         ),
+                        asyncio.create_task(
+                            self.mapping_status_loop(websocket)
+                        ),
                     ]
 
                     try:
@@ -692,7 +857,12 @@ class WebBridgeNode(Node):
 
     async def telemetry_loop(self, websocket: Any) -> None:
         while not self.stop_requested.is_set():
-            await asyncio.sleep(self.telemetry_period)
+            mapping_phase = self.mapping_runtime.snapshot(
+                self.map_revision
+            ).get('phase')
+            await asyncio.sleep(
+                0.2 if mapping_phase == 'MAPPING' else self.telemetry_period
+            )
 
             with self.telemetry_lock:
                 telemetry = (
@@ -822,6 +992,27 @@ class WebBridgeNode(Node):
             await self.send_json(websocket, path)
             sent_revision = revision
 
+    async def mapping_status_loop(self, websocket: Any) -> None:
+        while not self.stop_requested.is_set():
+            await self.send_mapping_status(websocket)
+            await asyncio.sleep(0.25)
+
+    async def send_mapping_status(
+        self,
+        websocket: Any,
+        *,
+        command_id: str | None = None,
+        accepted: bool = True,
+        detail: str | None = None,
+    ) -> None:
+        status = self.mapping_runtime.snapshot(self.map_revision)
+        status['robot_id'] = self.robot_id
+        status['command_id'] = command_id
+        status['accepted'] = accepted
+        if detail is not None:
+            status['detail'] = detail
+        await self.send_json(websocket, status)
+
     async def send_json(
         self,
         websocket: Any,
@@ -917,6 +1108,10 @@ class WebBridgeNode(Node):
             await self.handle_map_command(websocket, message)
         elif message_type == 'map_catalog_command':
             await self.handle_map_catalog_command(websocket, message)
+        elif message_type == 'mapping_command':
+            await self.handle_mapping_command(websocket, message)
+        elif message_type == 'mapping_teleop':
+            await self.handle_mapping_teleop(websocket, message)
         elif message_type == 'command':
             await self.queue_navigation_command(
                 websocket,
@@ -961,6 +1156,120 @@ class WebBridgeNode(Node):
             self.get_logger().debug(
                 f'Unhandled WebSocket message: {message_type}'
             )
+
+    async def handle_mapping_command(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+    ) -> None:
+        action = message.get('action')
+        command_id = message.get('command_id')
+        session_id = message.get('session_id')
+        valid = (
+            message.get('robot_id') == self.robot_id
+            and action in {'START', 'STOP', 'SAVE', 'DISCARD'}
+            and isinstance(command_id, str)
+            and command_id.startswith('mapping-')
+            and len(command_id) <= 100
+            and isinstance(session_id, str)
+            and session_id.startswith(f'mapping:{self.robot_id}:')
+            and len(session_id) <= 100
+        )
+        if not valid:
+            await self.send_mapping_status(
+                websocket, command_id=command_id if isinstance(command_id, str) else None,
+                accepted=False, detail='Invalid mapping command',
+            )
+            return
+        try:
+            if action == 'START':
+                with self.command_lock:
+                    navigation_active = self.active_command is not None
+                with self.preview_lock:
+                    preview_active = (
+                        self.active_preview is not None
+                        or not self.preview_queue.empty()
+                    )
+                with self.map_command_lock:
+                    map_operation_active = (
+                        self.active_map_command is not None
+                        or not self.map_command_queue.empty()
+                    )
+                if self.emergency_stop_latched.is_set():
+                    raise ValueError('Emergency Stop is latched')
+                if navigation_active or preview_active or map_operation_active:
+                    raise ValueError('Navigation, route preview, or map switching is active')
+                self.capture_mapping_pose_reference()
+                await asyncio.to_thread(self.mapping_runtime.start, session_id)
+            elif action == 'STOP':
+                self.publish_zero_velocity()
+                await asyncio.to_thread(self.mapping_runtime.stop_capture)
+            elif action == 'SAVE':
+                map_id = message.get('map_id')
+                metadata = message.get('metadata')
+                if not isinstance(map_id, str) or not isinstance(metadata, dict):
+                    raise ValueError('Map ID and metadata are required')
+                self.publish_zero_velocity()
+                await asyncio.to_thread(self.mapping_runtime.save, map_id, metadata)
+                self.restore_mapping_pose_estimate()
+                await self.send_map_catalog(websocket)
+            else:
+                self.publish_zero_velocity()
+                await asyncio.to_thread(self.mapping_runtime.discard)
+                self.restore_mapping_pose_estimate()
+            await self.send_mapping_status(websocket, command_id=command_id)
+        except Exception as error:
+            self.get_logger().error(f'Mapping command {action} failed: {error}')
+            await self.send_mapping_status(
+                websocket,
+                command_id=command_id,
+                accepted=False,
+                detail=str(error)[:500],
+            )
+
+    async def handle_mapping_teleop(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+    ) -> None:
+        snapshot = self.mapping_runtime.snapshot(self.map_revision)
+        linear_x = message.get('linear_x')
+        angular_z = message.get('angular_z')
+        valid = (
+            message.get('robot_id') == self.robot_id
+            and message.get('session_id') == snapshot.get('session_id')
+            and snapshot.get('phase') == 'MAPPING'
+            and not self.emergency_stop_latched.is_set()
+            and isinstance(linear_x, (int, float))
+            and not isinstance(linear_x, bool)
+            and isinstance(angular_z, (int, float))
+            and not isinstance(angular_z, bool)
+            and math.isfinite(float(linear_x))
+            and math.isfinite(float(angular_z))
+            and abs(float(linear_x)) <= 0.22
+            and abs(float(angular_z)) <= 1.0
+        )
+        if not valid:
+            self.get_logger().warning(
+                'Rejected invalid mapping teleoperation command'
+            )
+            return
+        twist = Twist()
+        twist.linear.x = float(linear_x)
+        twist.angular.z = float(angular_z)
+        self.emergency_velocity_publisher.publish(twist)
+        with self.mapping_velocity_lock:
+            self.mapping_velocity_deadline = time.monotonic() + self.mapping_teleop_deadman_seconds
+            self.mapping_velocity_active = bool(linear_x or angular_z)
+
+    def enforce_mapping_deadman(self) -> None:
+        should_stop = False
+        with self.mapping_velocity_lock:
+            if self.mapping_velocity_active and time.monotonic() >= self.mapping_velocity_deadline:
+                self.mapping_velocity_active = False
+                should_stop = True
+        if should_stop:
+            self.publish_zero_velocity()
 
     async def handle_map_command(
         self,
@@ -2612,8 +2921,11 @@ class WebBridgeNode(Node):
     def destroy_node(self) -> bool:
         self.stop_requested.set()
         self.emergency_stop_latched.clear()
+        self.mapping_runtime.shutdown()
         self.destroy_timer(self.preview_timer)
         self.destroy_timer(self.emergency_zero_timer)
+        self.destroy_timer(self.mapping_deadman_timer)
+        self.destroy_timer(self.mapping_pose_timer)
         self.destroy_publisher(
             self.emergency_velocity_publisher
         )
