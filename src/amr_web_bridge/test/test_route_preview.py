@@ -21,7 +21,10 @@ def bridge():
     value = SimpleNamespace(
         preview_queue=Queue(),
         preview_lock=threading.Lock(),
+        map_command_queue=Queue(),
+        map_command_lock=threading.Lock(),
         active_preview=None,
+        active_map_command=None,
         sent=[],
     )
 
@@ -52,6 +55,23 @@ def test_invalid_preview_returns_unavailable_result():
     assert value.preview_queue.empty()
     assert value.sent[-1]['type'] == 'route_preview_result'
     assert value.sent[-1]['status'] == 'unavailable'
+
+
+def test_preview_is_rejected_while_map_switch_is_active():
+    value = bridge()
+    value.active_map_command = {'command_id': 'map-switch:robot01:abc'}
+
+    asyncio.run(
+        WebBridgeNode.queue_route_preview(
+            value,
+            object(),
+            preview_request(),
+        )
+    )
+
+    assert value.preview_queue.empty()
+    assert value.sent[-1]['status'] == 'unavailable'
+    assert value.sent[-1]['detail'] == 'Map switch is in progress'
 
 
 def test_finishing_preview_clears_state_and_returns_both_paths():

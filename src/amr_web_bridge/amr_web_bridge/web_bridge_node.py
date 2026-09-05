@@ -15,6 +15,7 @@ from action_msgs.msg import GoalStatus
 from diagnostic_msgs.msg import DiagnosticArray
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import ComputePathToPose, NavigateToPose
+from nav2_msgs.srv import LoadMap
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 import rclpy
 from rclpy.action import ActionClient
@@ -27,6 +28,14 @@ from rclpy.qos import (
 )
 import websockets
 
+from .map_catalog import (
+    available_map_yaml,
+    build_map_catalog,
+    delete_map,
+    MAP_ID_PATTERN,
+    rename_map,
+    update_map_metadata,
+)
 from .path_utils import (
     path_signature,
     serialize_path,
@@ -46,6 +55,16 @@ class WebBridgeNode(Node):
         self.declare_parameter('reconnect_delay', 3.0)
         self.declare_parameter('pose_topic', '/amcl_pose')
         self.declare_parameter('map_topic', '/map')
+        self.declare_parameter(
+            'maps_directory',
+            os.getenv('AMR_MAPS_DIRECTORY', ''),
+        )
+        self.declare_parameter(
+            'active_map_id',
+            os.getenv('AMR_ACTIVE_MAP_ID', 'warehouse_map'),
+        )
+        self.declare_parameter('map_catalog_period', 10.0)
+        self.declare_parameter('load_map_service', '/map_server/load_map')
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('diagnostics_topic', '/diagnostics')
         self.declare_parameter('path_topic', '/plan')
@@ -84,6 +103,19 @@ class WebBridgeNode(Node):
         )
         self.map_topic = str(
             self.get_parameter('map_topic').value
+        )
+        self.maps_directory = str(
+            self.get_parameter('maps_directory').value
+        )
+        self.active_map_id = str(
+            self.get_parameter('active_map_id').value
+        ).strip() or None
+        self.map_catalog_period = max(
+            2.0,
+            float(self.get_parameter('map_catalog_period').value),
+        )
+        self.load_map_service = str(
+            self.get_parameter('load_map_service').value
         )
         self.odom_topic = str(
             self.get_parameter('odom_topic').value
@@ -150,6 +182,7 @@ class WebBridgeNode(Node):
         self.command_lock = threading.Lock()
         self.path_lock = threading.Lock()
         self.preview_lock = threading.Lock()
+        self.map_command_lock = threading.Lock()
         self.emergency_stop_latched = threading.Event()
         self.last_emergency_command_id: str | None = None
         self.latest_telemetry: dict[str, Any] | None = None
@@ -182,6 +215,8 @@ class WebBridgeNode(Node):
         self.latest_path_signature: tuple[Any, ...] | None = None
         self.preview_queue: Queue[dict[str, Any]] = Queue()
         self.active_preview: dict[str, Any] | None = None
+        self.map_command_queue: Queue[dict[str, Any]] = Queue()
+        self.active_map_command: dict[str, Any] | None = None
 
         self.asyncio_loop: asyncio.AbstractEventLoop | None = None
         self.send_lock: asyncio.Lock | None = None
@@ -253,6 +288,10 @@ class WebBridgeNode(Node):
             ComputePathToPose,
             self.compute_path_action,
         )
+        self.load_map_client = self.create_client(
+            LoadMap,
+            self.load_map_service,
+        )
         self.command_timer = self.create_timer(
             0.1,
             self.process_command_queue,
@@ -260,6 +299,10 @@ class WebBridgeNode(Node):
         self.preview_timer = self.create_timer(
             0.1,
             self.process_preview_queue,
+        )
+        self.map_command_timer = self.create_timer(
+            0.1,
+            self.process_map_command_queue,
         )
         self.emergency_velocity_publisher = self.create_publisher(
             Twist,
@@ -287,6 +330,12 @@ class WebBridgeNode(Node):
             f'Pose telemetry topic: {self.pose_topic}'
         )
         self.get_logger().info(f'Map topic: {self.map_topic}')
+        self.get_logger().info(
+            f'Map catalog directory: {self.maps_directory or "not configured"}'
+        )
+        self.get_logger().info(
+            f'Nav2 load map service: {self.load_map_service}'
+        )
         self.get_logger().info(
             f'Nav2 action: {self.navigate_action}'
         )
@@ -340,6 +389,9 @@ class WebBridgeNode(Node):
             'y': float(pose.position.y),
             'yaw': float(yaw),
             'battery': self.battery_percent,
+            # Gazebo currently has no BatteryState source. Keep the configured
+            # charge visible for simulation while explicitly identifying it.
+            'battery_source': 'SIMULATED',
             'frame_id': message.header.frame_id or 'map',
             'timestamp': self.utc_timestamp(),
         }
@@ -590,6 +642,9 @@ class WebBridgeNode(Node):
                             self.map_loop(websocket)
                         ),
                         asyncio.create_task(
+                            self.map_catalog_loop(websocket)
+                        ),
+                        asyncio.create_task(
                             self.diagnostics_loop(websocket)
                         ),
                         asyncio.create_task(
@@ -685,6 +740,19 @@ class WebBridgeNode(Node):
                 },
             )
             sent_revision = revision
+
+    async def send_map_catalog(self, websocket: Any) -> None:
+        catalog = build_map_catalog(
+            self.maps_directory,
+            self.active_map_id,
+            self.robot_id,
+        )
+        await self.send_json(websocket, catalog)
+
+    async def map_catalog_loop(self, websocket: Any) -> None:
+        while not self.stop_requested.is_set():
+            await self.send_map_catalog(websocket)
+            await asyncio.sleep(self.map_catalog_period)
 
     async def diagnostics_loop(
         self,
@@ -838,6 +906,17 @@ class WebBridgeNode(Node):
                 'Map acknowledged by FastAPI: '
                 f"revision {message.get('revision')}"
             )
+        elif message_type == 'map_catalog_ack':
+            self.get_logger().info(
+                'Map catalog acknowledged by FastAPI: '
+                f"{message.get('map_count', 0)} maps"
+            )
+        elif message_type == 'map_catalog_request':
+            await self.send_map_catalog(websocket)
+        elif message_type == 'map_command':
+            await self.handle_map_command(websocket, message)
+        elif message_type == 'map_catalog_command':
+            await self.handle_map_catalog_command(websocket, message)
         elif message_type == 'command':
             await self.queue_navigation_command(
                 websocket,
@@ -883,12 +962,188 @@ class WebBridgeNode(Node):
                 f'Unhandled WebSocket message: {message_type}'
             )
 
+    async def handle_map_command(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+    ) -> None:
+        command_id = message.get('command_id')
+        map_id = message.get('map_id')
+        valid = (
+            message.get('command') == 'switch_map'
+            and message.get('robot_id') == self.robot_id
+            and isinstance(command_id, str)
+            and command_id.startswith(f'map-switch:{self.robot_id}:')
+            and len(command_id) <= 100
+            and isinstance(map_id, str)
+        )
+        if not valid:
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'map_switch_result',
+                    'command_id': command_id if isinstance(command_id, str) else '',
+                    'robot_id': self.robot_id,
+                    'map_id': map_id if isinstance(map_id, str) else '',
+                    'accepted': False,
+                    'detail': 'Invalid map switch command',
+                },
+            )
+            return
+
+        yaml_path = available_map_yaml(self.maps_directory, map_id)
+        with self.command_lock:
+            navigation_active = self.active_command is not None
+        with self.preview_lock:
+            preview_active = (
+                self.active_preview is not None
+                or not self.preview_queue.empty()
+            )
+        with self.map_command_lock:
+            map_switch_active = (
+                self.active_map_command is not None
+                or not self.map_command_queue.empty()
+            )
+        if (
+            navigation_active
+            or preview_active
+            or map_switch_active
+            or yaml_path is None
+        ):
+            detail = (
+                'Navigation is active'
+                if navigation_active else
+                'Route preview is active'
+                if preview_active else
+                'Another map switch is active'
+                if map_switch_active else
+                'Map is unavailable on the robot'
+            )
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'map_switch_result',
+                    'command_id': command_id,
+                    'robot_id': self.robot_id,
+                    'map_id': map_id,
+                    'accepted': False,
+                    'detail': detail,
+                },
+            )
+            return
+
+        queued = dict(message)
+        queued['yaml_path'] = str(yaml_path)
+        self.map_command_queue.put(queued)
+        self.get_logger().info(
+            f'Queued Nav2 map switch {command_id} to {map_id}'
+        )
+
+    async def handle_map_catalog_command(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+    ) -> None:
+        command_id = message.get('command_id')
+        map_id = message.get('map_id')
+        action = message.get('action')
+        valid = (
+            message.get('robot_id') == self.robot_id
+            and isinstance(command_id, str)
+            and command_id.startswith(f'map-catalog:{self.robot_id}:')
+            and len(command_id) <= 100
+            and isinstance(map_id, str)
+            and MAP_ID_PATTERN.fullmatch(map_id) is not None
+            and action in {'UPDATE_METADATA', 'RENAME', 'DELETE'}
+        )
+        result_map_id = None
+        accepted = False
+        detail = 'Invalid map catalog command'
+        if valid:
+            with self.command_lock:
+                navigation_active = self.active_command is not None
+            with self.preview_lock:
+                preview_active = (
+                    self.active_preview is not None
+                    or not self.preview_queue.empty()
+                )
+            with self.map_command_lock:
+                switch_active = (
+                    self.active_map_command is not None
+                    or not self.map_command_queue.empty()
+                )
+            try:
+                if switch_active:
+                    raise ValueError('A map switch is active')
+                if action in {'RENAME', 'DELETE'} and (
+                    navigation_active or preview_active
+                ):
+                    raise ValueError('Navigation or route preview is active')
+                if action in {'RENAME', 'DELETE'} and map_id == self.active_map_id:
+                    raise ValueError('The active map cannot be changed')
+                if action == 'UPDATE_METADATA':
+                    metadata = message.get('metadata')
+                    if not isinstance(metadata, dict):
+                        raise ValueError('Map metadata is invalid')
+                    update_map_metadata(self.maps_directory, map_id, metadata)
+                    result_map_id = map_id
+                    detail = 'Map metadata updated'
+                elif action == 'RENAME':
+                    new_map_id = message.get('new_map_id')
+                    if not isinstance(new_map_id, str):
+                        raise ValueError('New map ID is invalid')
+                    rename_map(self.maps_directory, map_id, new_map_id)
+                    result_map_id = new_map_id
+                    detail = 'Map renamed'
+                else:
+                    delete_map(self.maps_directory, map_id)
+                    detail = 'Map deleted'
+                accepted = True
+            except (OSError, ValueError) as error:
+                detail = str(error)
+
+        await self.send_json(websocket, {
+            'type': 'map_catalog_operation_result',
+            'command_id': command_id if isinstance(command_id, str) else '',
+            'robot_id': self.robot_id,
+            'map_id': map_id if isinstance(map_id, str) else '',
+            'action': action if action in {
+                'UPDATE_METADATA', 'RENAME', 'DELETE'
+            } else 'UPDATE_METADATA',
+            'accepted': accepted,
+            'result_map_id': result_map_id,
+            'detail': detail,
+        })
+        if accepted:
+            await self.send_map_catalog(websocket)
+
     async def queue_route_preview(
         self,
         websocket: Any,
         message: dict[str, Any],
     ) -> None:
         request_id = message.get('request_id')
+
+        with self.map_command_lock:
+            map_switch_active = (
+                self.active_map_command is not None
+                or not self.map_command_queue.empty()
+            )
+        if map_switch_active:
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'route_preview_result',
+                    'request_id': (
+                        request_id if isinstance(request_id, str) else ''
+                    ),
+                    'status': 'unavailable',
+                    'detail': 'Map switch is in progress',
+                    'pickup_path': [],
+                    'delivery_path': [],
+                },
+            )
+            return
 
         def valid_pose(value: Any) -> bool:
             return (
@@ -1579,11 +1834,135 @@ class WebBridgeNode(Node):
             f'Nav2 route preview {request_id}: {status}'
         )
 
+    def process_map_command_queue(self) -> None:
+        with self.map_command_lock:
+            if self.active_map_command is not None:
+                return
+        try:
+            command = self.map_command_queue.get_nowait()
+        except Empty:
+            return
+
+        with self.command_lock:
+            if self.active_command is not None:
+                self.finish_map_switch(
+                    command,
+                    False,
+                    'Navigation became active before the map switch',
+                )
+                return
+        with self.preview_lock:
+            if (
+                self.active_preview is not None
+                or not self.preview_queue.empty()
+            ):
+                self.finish_map_switch(
+                    command,
+                    False,
+                    'Route preview became active before the map switch',
+                )
+                return
+        with self.map_command_lock:
+            self.active_map_command = command
+
+        if not self.load_map_client.wait_for_service(timeout_sec=1.0):
+            self.finish_map_switch(
+                command,
+                False,
+                'Nav2 LoadMap service is unavailable',
+            )
+            return
+
+        request = LoadMap.Request()
+        request.map_url = str(command['yaml_path'])
+        future = self.load_map_client.call_async(request)
+        future.add_done_callback(
+            lambda result: self.map_switch_result_callback(result, command)
+        )
+        self.get_logger().info(
+            f"Requesting Nav2 map switch to {command['map_id']}"
+        )
+
+    def map_switch_result_callback(
+        self,
+        future: Any,
+        command: dict[str, Any],
+    ) -> None:
+        try:
+            response = future.result()
+            result_code = int(response.result)
+        except Exception as error:
+            self.finish_map_switch(
+                command,
+                False,
+                f'Nav2 LoadMap request failed: {error}',
+            )
+            return
+
+        if result_code != LoadMap.Response.RESULT_SUCCESS:
+            details = {
+                LoadMap.Response.RESULT_MAP_DOES_NOT_EXIST: 'Map does not exist',
+                LoadMap.Response.RESULT_INVALID_MAP_DATA: 'Map data is invalid',
+                LoadMap.Response.RESULT_INVALID_MAP_METADATA: 'Map metadata is invalid',
+                LoadMap.Response.RESULT_UNDEFINED_FAILURE: 'Nav2 map server failed',
+            }
+            self.finish_map_switch(
+                command,
+                False,
+                details.get(result_code, f'Nav2 returned result {result_code}'),
+            )
+            return
+
+        self.active_map_id = str(command['map_id'])
+        if int(response.map.info.width) > 0 and int(response.map.info.height) > 0:
+            self.map_callback(response.map)
+        self.finish_map_switch(command, True, 'Nav2 map server loaded the map')
+
+    def finish_map_switch(
+        self,
+        command: dict[str, Any],
+        accepted: bool,
+        detail: str,
+    ) -> None:
+        command_id = str(command.get('command_id', ''))
+        with self.map_command_lock:
+            active = self.active_map_command
+            if active is not None and active.get('command_id') == command_id:
+                self.active_map_command = None
+        self.send_from_ros(
+            {
+                'type': 'map_switch_result',
+                'command_id': command_id,
+                'robot_id': self.robot_id,
+                'map_id': str(command.get('map_id', '')),
+                'accepted': accepted,
+                'detail': detail,
+            }
+        )
+        if accepted:
+            self.send_from_ros(
+                build_map_catalog(
+                    self.maps_directory,
+                    self.active_map_id,
+                    self.robot_id,
+                )
+            )
+        self.get_logger().info(
+            f"Map switch {command_id}: {'succeeded' if accepted else 'failed'}"
+        )
+
     def process_command_queue(self) -> None:
         # Cancellation always takes priority over
         # starting another navigation command.
         if self.process_cancel_queue():
             return
+
+        with self.map_command_lock:
+            if (
+                self.active_map_command is not None
+                or not self.map_command_queue.empty()
+            ):
+                return
 
         if self.emergency_stop_latched.is_set():
             self.clear_command_queue()
