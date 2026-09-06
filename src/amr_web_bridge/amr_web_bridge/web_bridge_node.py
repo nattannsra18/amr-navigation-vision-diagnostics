@@ -16,6 +16,7 @@ from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
 from diagnostic_msgs.msg import DiagnosticArray
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
+from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import ComputePathToPose, NavigateToPose
 from nav2_msgs.srv import LoadMap
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
@@ -29,6 +30,7 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 from rclpy.time import Time
+from std_srvs.srv import Empty as EmptyService
 from tf2_ros import Buffer, TransformListener
 import websockets
 
@@ -89,6 +91,13 @@ class WebBridgeNode(Node):
         self.declare_parameter('emergency_stop_zero_rate', 10.0)
         self.declare_parameter('mapping_teleop_deadman_seconds', 0.35)
         self.declare_parameter('initial_pose_topic', '/initialpose')
+        self.declare_parameter('amcl_state_service', '/amcl/get_state')
+        self.declare_parameter(
+            'global_localization_service',
+            '/reinitialize_global_localization',
+        )
+        self.declare_parameter('localization_scan_angular_speed', 0.26)
+        self.declare_parameter('localization_scan_timeout_seconds', 28.0)
 
         self.server_url = str(
             self.get_parameter('server_url').value
@@ -184,6 +193,20 @@ class WebBridgeNode(Node):
         self.initial_pose_topic = str(
             self.get_parameter('initial_pose_topic').value
         )
+        self.amcl_state_service = str(
+            self.get_parameter('amcl_state_service').value
+        )
+        self.global_localization_service = str(
+            self.get_parameter('global_localization_service').value
+        )
+        self.localization_scan_angular_speed = min(
+            0.4,
+            max(0.15, float(self.get_parameter('localization_scan_angular_speed').value)),
+        )
+        self.localization_scan_timeout_seconds = min(
+            60.0,
+            max(10.0, float(self.get_parameter('localization_scan_timeout_seconds').value)),
+        )
         self.websocket_uri = (
             f'{self.server_url}/ws/robots/{self.robot_id}'
         )
@@ -198,6 +221,7 @@ class WebBridgeNode(Node):
         self.preview_lock = threading.Lock()
         self.map_command_lock = threading.Lock()
         self.mapping_velocity_lock = threading.Lock()
+        self.localization_lock = threading.Lock()
         self.emergency_stop_latched = threading.Event()
         self.last_emergency_command_id: str | None = None
         self.latest_telemetry: dict[str, Any] | None = None
@@ -208,6 +232,17 @@ class WebBridgeNode(Node):
         ) = None
         self.map_revision = 0
         self.diagnostics_revision = 0
+        self.node_started_monotonic = time.monotonic()
+        self.latest_localization_pose: dict[str, Any] | None = None
+        self.last_localization_monotonic: float | None = None
+        self.amcl_state = 'UNKNOWN'
+        self.amcl_state_future: Any = None
+        self.localization_recovery_count = 0
+        self.localization_recovery_active = False
+        self.localization_recovery_started_monotonic: float | None = None
+        self.localization_convergence_samples = 0
+        self.localization_scan_active = False
+        self.localization_scan_started_monotonic: float | None = None
         self.command_queue: Queue[
             dict[str, Any]
         ] = Queue()
@@ -232,6 +267,8 @@ class WebBridgeNode(Node):
         self.active_preview: dict[str, Any] | None = None
         self.map_command_queue: Queue[dict[str, Any]] = Queue()
         self.active_map_command: dict[str, Any] | None = None
+        self.localization_command_queue: Queue[dict[str, Any]] = Queue()
+        self.active_localization_command: dict[str, Any] | None = None
         mapping_params_file = os.path.join(
             get_package_share_directory('amr_web_bridge'),
             'config',
@@ -245,6 +282,8 @@ class WebBridgeNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.mapping_velocity_deadline = 0.0
         self.mapping_velocity_active = False
+        self.localization_velocity_deadline = 0.0
+        self.localization_velocity_active = False
         self.mapping_pose_reference: tuple[
             tuple[float, float, float],
             tuple[float, float, float],
@@ -324,6 +363,14 @@ class WebBridgeNode(Node):
             LoadMap,
             self.load_map_service,
         )
+        self.amcl_state_client = self.create_client(
+            GetState,
+            self.amcl_state_service,
+        )
+        self.global_localization_client = self.create_client(
+            EmptyService,
+            self.global_localization_service,
+        )
         self.command_timer = self.create_timer(
             0.1,
             self.process_command_queue,
@@ -335,6 +382,14 @@ class WebBridgeNode(Node):
         self.map_command_timer = self.create_timer(
             0.1,
             self.process_map_command_queue,
+        )
+        self.localization_command_timer = self.create_timer(
+            0.1,
+            self.process_localization_command_queue,
+        )
+        self.amcl_state_timer = self.create_timer(
+            1.0,
+            self.poll_amcl_state,
         )
         self.emergency_velocity_publisher = self.create_publisher(
             Twist,
@@ -353,6 +408,10 @@ class WebBridgeNode(Node):
         self.mapping_deadman_timer = self.create_timer(
             0.05,
             self.enforce_mapping_deadman,
+        )
+        self.localization_scan_timer = self.create_timer(
+            0.1,
+            self.run_localization_scan,
         )
         self.mapping_pose_timer = self.create_timer(
             0.2,
@@ -443,6 +502,21 @@ class WebBridgeNode(Node):
 
         with self.telemetry_lock:
             self.latest_telemetry = telemetry
+        covariance = message.pose.covariance
+        with self.localization_lock:
+            self.latest_localization_pose = {
+                'frame_id': message.header.frame_id or 'map',
+                'x': float(pose.position.x),
+                'y': float(pose.position.y),
+                'yaw': float(yaw),
+                'position_uncertainty': math.sqrt(max(
+                    0.0,
+                    float(covariance[0]),
+                    float(covariance[7]),
+                )),
+                'yaw_uncertainty': math.sqrt(max(0.0, float(covariance[35]))),
+            }
+            self.last_localization_monotonic = time.monotonic()
 
     def odom_callback(
         self,
@@ -578,17 +652,188 @@ class WebBridgeNode(Node):
         )
         pose_yaw = map_yaw + odom_yaw1 - odom_yaw0
 
+        self.publish_initial_pose(
+            pose_x,
+            pose_y,
+            pose_yaw,
+            position_uncertainty=0.5,
+            yaw_uncertainty=math.sqrt(0.0685),
+        )
+
+    def publish_initial_pose(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        *,
+        position_uncertainty: float,
+        yaw_uncertainty: float,
+    ) -> None:
         message = PoseWithCovarianceStamped()
         message.header.stamp = self.get_clock().now().to_msg()
         message.header.frame_id = 'map'
-        message.pose.pose.position.x = pose_x
-        message.pose.pose.position.y = pose_y
-        message.pose.pose.orientation.z = math.sin(pose_yaw / 2.0)
-        message.pose.pose.orientation.w = math.cos(pose_yaw / 2.0)
-        message.pose.covariance[0] = 0.25
-        message.pose.covariance[7] = 0.25
-        message.pose.covariance[35] = 0.0685
+        message.pose.pose.position.x = x
+        message.pose.pose.position.y = y
+        message.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        message.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        message.pose.covariance[0] = position_uncertainty ** 2
+        message.pose.covariance[7] = position_uncertainty ** 2
+        message.pose.covariance[35] = yaw_uncertainty ** 2
         self.initial_pose_publisher.publish(message)
+
+    def poll_amcl_state(self) -> None:
+        future = self.amcl_state_future
+        if future is not None and not future.done():
+            return
+        if not self.amcl_state_client.service_is_ready():
+            with self.localization_lock:
+                self.amcl_state = 'UNKNOWN'
+            return
+        future = self.amcl_state_client.call_async(GetState.Request())
+        self.amcl_state_future = future
+        future.add_done_callback(self.amcl_state_callback)
+
+    def amcl_state_callback(self, future: Any) -> None:
+        try:
+            label = str(future.result().current_state.label).lower()
+            state = 'ACTIVE' if label == 'active' else 'INACTIVE'
+        except Exception:
+            state = 'UNKNOWN'
+        with self.localization_lock:
+            self.amcl_state = state
+
+    def localization_snapshot(self) -> dict[str, Any]:
+        now = time.monotonic()
+        with self.localization_lock:
+            last_pose = (
+                dict(self.latest_localization_pose)
+                if self.latest_localization_pose is not None else None
+            )
+            last_received = self.last_localization_monotonic
+            amcl_state = self.amcl_state
+            recovery_count = self.localization_recovery_count
+            recovery_active = self.localization_recovery_active
+            scan_active = self.localization_scan_active
+            scan_started = self.localization_scan_started_monotonic
+        with self.velocity_lock:
+            velocity = (
+                dict(self.latest_velocity)
+                if self.latest_velocity is not None else None
+            )
+        moving = bool(
+            velocity
+            and (
+                abs(velocity['linear_velocity']) > 0.02
+                or abs(velocity['angular_velocity']) > 0.05
+            )
+        )
+        pose_age = max(0.0, now - last_received) if last_received is not None else None
+        tf_available = False
+        pose = last_pose
+        try:
+            x, y, yaw = self.lookup_planar_pose('map', 'base_footprint')
+            tf_available = True
+            pose = {
+                **(last_pose or {}),
+                'frame_id': 'map',
+                'x': x,
+                'y': y,
+                'yaw': yaw,
+            }
+        except Exception:
+            pass
+
+        mapping_active = self.mapping_runtime.snapshot(
+            self.map_revision
+        ).get('phase') != 'IDLE'
+        position_uncertainty = (
+            last_pose.get('position_uncertainty') if last_pose else None
+        )
+        yaw_uncertainty = (
+            last_pose.get('yaw_uncertainty') if last_pose else None
+        )
+        if mapping_active:
+            health, reason, detail = (
+                'UNKNOWN', 'MAPPING_ACTIVE', 'Localization is paused during mapping'
+            )
+        elif amcl_state == 'INACTIVE':
+            health, reason, detail = (
+                'LOST', 'AMCL_INACTIVE', 'AMCL lifecycle node is not active'
+            )
+        elif pose is None:
+            health = 'LOST' if now - self.node_started_monotonic > 5.0 else 'UNKNOWN'
+            reason, detail = 'NO_POSE', 'No AMCL pose has been received'
+        elif not tf_available:
+            health, reason, detail = (
+                'LOST', 'TF_UNAVAILABLE', 'map to base_footprint transform is unavailable'
+            )
+        elif moving and pose_age is not None and pose_age > 3.0:
+            health, reason, detail = (
+                'LOST', 'POSE_STALE', 'AMCL pose is stale while the robot is moving'
+            )
+        elif (
+            position_uncertainty is not None
+            and yaw_uncertainty is not None
+            and (position_uncertainty > 1.0 or yaw_uncertainty > 0.75)
+        ):
+            health, reason, detail = (
+                'DEGRADED', 'HIGH_UNCERTAINTY', 'AMCL pose uncertainty is high'
+            )
+        else:
+            health, reason, detail = (
+                'LOCALIZED', 'READY', 'AMCL pose and map transform are available'
+            )
+        recovery_finished = False
+        with self.localization_lock:
+            if self.localization_recovery_active:
+                old_enough = (
+                    self.localization_recovery_started_monotonic is not None
+                    and now - self.localization_recovery_started_monotonic >= 5.0
+                )
+                converged = old_enough and health == 'LOCALIZED' and not moving
+                self.localization_convergence_samples = (
+                    self.localization_convergence_samples + 1 if converged else 0
+                )
+                if self.localization_convergence_samples >= 6:
+                    self.localization_recovery_active = False
+                    self.localization_recovery_started_monotonic = None
+                    self.localization_convergence_samples = 0
+                    self.localization_scan_active = False
+                    self.localization_scan_started_monotonic = None
+                    recovery_finished = True
+            recovery_active = self.localization_recovery_active
+            scan_active = self.localization_scan_active
+            scan_started = self.localization_scan_started_monotonic
+        if recovery_finished:
+            self.publish_zero_velocity()
+        clean_pose = None if pose is None else {
+            'frame_id': str(pose.get('frame_id', 'map')),
+            'x': float(pose['x']),
+            'y': float(pose['y']),
+            'yaw': float(pose['yaw']),
+        }
+        return {
+            'type': 'localization_status',
+            'robot_id': self.robot_id,
+            'health': health,
+            'reason': reason,
+            'amcl_state': amcl_state,
+            'map_id': self.active_map_id,
+            'pose': clean_pose,
+            'pose_age_seconds': pose_age,
+            'position_uncertainty': position_uncertainty,
+            'yaw_uncertainty': yaw_uncertainty,
+            'tf_available': tf_available,
+            'moving': moving,
+            'recovery_count': recovery_count,
+            'recovery_active': recovery_active,
+            'automatic_scan_active': scan_active,
+            'automatic_scan_progress': (
+                min(1.0, max(0.0, (now - scan_started) / self.localization_scan_timeout_seconds))
+                if scan_active and scan_started is not None else 0.0
+            ),
+            'detail': detail,
+        }
 
     @staticmethod
     def normalize_diagnostic_level(level: Any) -> int | None:
@@ -815,6 +1060,9 @@ class WebBridgeNode(Node):
                         asyncio.create_task(
                             self.mapping_status_loop(websocket)
                         ),
+                        asyncio.create_task(
+                            self.localization_status_loop(websocket)
+                        ),
                     ]
 
                     try:
@@ -1013,6 +1261,28 @@ class WebBridgeNode(Node):
             status['detail'] = detail
         await self.send_json(websocket, status)
 
+    async def localization_status_loop(self, websocket: Any) -> None:
+        while not self.stop_requested.is_set():
+            await self.send_localization_status(websocket)
+            await asyncio.sleep(0.5)
+
+    async def send_localization_status(
+        self,
+        websocket: Any,
+        *,
+        command_id: str | None = None,
+        command_action: str | None = None,
+        accepted: bool = True,
+        detail: str | None = None,
+    ) -> None:
+        status = self.localization_snapshot()
+        status['command_id'] = command_id
+        status['command_action'] = command_action
+        status['accepted'] = accepted
+        if detail is not None:
+            status['detail'] = detail
+        await self.send_json(websocket, status)
+
     async def send_json(
         self,
         websocket: Any,
@@ -1112,6 +1382,12 @@ class WebBridgeNode(Node):
             await self.handle_mapping_command(websocket, message)
         elif message_type == 'mapping_teleop':
             await self.handle_mapping_teleop(websocket, message)
+        elif message_type == 'localization_teleop':
+            await self.handle_localization_teleop(websocket, message)
+        elif message_type == 'localization_scan':
+            await self.handle_localization_scan(websocket, message)
+        elif message_type == 'localization_command':
+            await self.handle_localization_command(websocket, message)
         elif message_type == 'command':
             await self.queue_navigation_command(
                 websocket,
@@ -1197,7 +1473,12 @@ class WebBridgeNode(Node):
                     )
                 if self.emergency_stop_latched.is_set():
                     raise ValueError('Emergency Stop is latched')
-                if navigation_active or preview_active or map_operation_active:
+                if (
+                    navigation_active
+                    or preview_active
+                    or map_operation_active
+                    or self.active_localization_command is not None
+                ):
                     raise ValueError('Navigation, route preview, or map switching is active')
                 self.capture_mapping_pose_reference()
                 await asyncio.to_thread(self.mapping_runtime.start, session_id)
@@ -1262,11 +1543,295 @@ class WebBridgeNode(Node):
             self.mapping_velocity_deadline = time.monotonic() + self.mapping_teleop_deadman_seconds
             self.mapping_velocity_active = bool(linear_x or angular_z)
 
+    async def handle_localization_command(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+    ) -> None:
+        action = message.get('action')
+        command_id = message.get('command_id')
+        valid = (
+            message.get('robot_id') == self.robot_id
+            and action in {'SET_INITIAL_POSE', 'GLOBAL_LOCALIZATION'}
+            and isinstance(command_id, str)
+            and command_id.startswith('localization-')
+            and len(command_id) <= 100
+        )
+        if action == 'SET_INITIAL_POSE':
+            pose = message.get('pose')
+            valid = valid and self.valid_localization_pose(pose) and all(
+                isinstance(message.get(key), (int, float))
+                and not isinstance(message.get(key), bool)
+                and math.isfinite(float(message[key]))
+                for key in ('position_uncertainty', 'yaw_uncertainty')
+            )
+        with self.command_lock:
+            navigation_active = self.active_command is not None
+        with self.preview_lock:
+            preview_active = (
+                self.active_preview is not None or not self.preview_queue.empty()
+            )
+        with self.map_command_lock:
+            map_operation_active = (
+                self.active_map_command is not None
+                or not self.map_command_queue.empty()
+            )
+        mapping_active = self.mapping_runtime.snapshot(
+            self.map_revision
+        ).get('phase') != 'IDLE'
+        blocked = (
+            navigation_active
+            or preview_active
+            or map_operation_active
+            or mapping_active
+            or self.active_localization_command is not None
+            or self.emergency_stop_latched.is_set()
+        )
+        if not valid or blocked:
+            detail = (
+                'Invalid localization command' if not valid
+                else 'Robot navigation or another maintenance operation is active'
+            )
+            await self.send_localization_status(
+                websocket,
+                command_id=command_id if isinstance(command_id, str) else None,
+                command_action=action if action in {
+                    'SET_INITIAL_POSE', 'GLOBAL_LOCALIZATION'
+                } else None,
+                accepted=False,
+                detail=detail,
+            )
+            return
+        self.active_localization_command = dict(message)
+        self.localization_command_queue.put(dict(message))
+
+    async def handle_localization_teleop(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+    ) -> None:
+        del websocket
+        linear_x = message.get('linear_x')
+        angular_z = message.get('angular_z')
+        with self.localization_lock:
+            recovery_active = self.localization_recovery_active
+            scan_active = self.localization_scan_active
+        with self.command_lock:
+            navigation_active = self.active_command is not None
+        mapping_active = self.mapping_runtime.snapshot(
+            self.map_revision
+        ).get('phase') != 'IDLE'
+        valid = (
+            message.get('robot_id') == self.robot_id
+            and recovery_active
+            and not scan_active
+            and not navigation_active
+            and not mapping_active
+            and not self.emergency_stop_latched.is_set()
+            and isinstance(linear_x, (int, float))
+            and not isinstance(linear_x, bool)
+            and isinstance(angular_z, (int, float))
+            and not isinstance(angular_z, bool)
+            and math.isfinite(float(linear_x))
+            and math.isfinite(float(angular_z))
+            and abs(float(linear_x)) <= 0.12
+            and abs(float(angular_z)) <= 0.4
+        )
+        if not valid:
+            self.get_logger().warning(
+                'Rejected invalid localization recovery command'
+            )
+            return
+        twist = Twist()
+        twist.linear.x = float(linear_x)
+        twist.angular.z = float(angular_z)
+        self.emergency_velocity_publisher.publish(twist)
+        with self.mapping_velocity_lock:
+            self.localization_velocity_deadline = (
+                time.monotonic() + self.mapping_teleop_deadman_seconds
+            )
+            self.localization_velocity_active = bool(linear_x or angular_z)
+
+    async def handle_localization_scan(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+    ) -> None:
+        del websocket
+        action = message.get('action')
+        with self.localization_lock:
+            recovery_active = self.localization_recovery_active
+        with self.command_lock:
+            navigation_active = self.active_command is not None
+        mapping_active = self.mapping_runtime.snapshot(
+            self.map_revision
+        ).get('phase') != 'IDLE'
+        valid = (
+            message.get('robot_id') == self.robot_id
+            and action in {'START', 'STOP'}
+        )
+        if not valid:
+            self.get_logger().warning('Rejected invalid localization scan command')
+            return
+        if action == 'STOP':
+            with self.localization_lock:
+                self.localization_scan_active = False
+                self.localization_scan_started_monotonic = None
+            self.publish_zero_velocity()
+            return
+        if (
+            not recovery_active
+            or navigation_active
+            or mapping_active
+            or self.emergency_stop_latched.is_set()
+        ):
+            self.get_logger().warning('Rejected unsafe localization scan command')
+            return
+        with self.localization_lock:
+            self.localization_scan_active = True
+            self.localization_scan_started_monotonic = time.monotonic()
+
+    def run_localization_scan(self) -> None:
+        with self.localization_lock:
+            active = self.localization_scan_active
+            recovery_active = self.localization_recovery_active
+            started = self.localization_scan_started_monotonic
+        if not active:
+            return
+        with self.command_lock:
+            navigation_active = self.active_command is not None
+        mapping_active = self.mapping_runtime.snapshot(
+            self.map_revision
+        ).get('phase') != 'IDLE'
+        timed_out = bool(
+            started is not None
+            and time.monotonic() - started >= self.localization_scan_timeout_seconds
+        )
+        if (
+            not recovery_active
+            or navigation_active
+            or mapping_active
+            or timed_out
+            or self.emergency_stop_latched.is_set()
+        ):
+            with self.localization_lock:
+                self.localization_scan_active = False
+                self.localization_scan_started_monotonic = None
+            self.publish_zero_velocity()
+            return
+        twist = Twist()
+        twist.angular.z = self.localization_scan_angular_speed
+        self.emergency_velocity_publisher.publish(twist)
+
+    @staticmethod
+    def valid_localization_pose(value: Any) -> bool:
+        return (
+            isinstance(value, dict)
+            and value.get('frame_id') == 'map'
+            and all(
+                isinstance(value.get(key), (int, float))
+                and not isinstance(value.get(key), bool)
+                and math.isfinite(float(value[key]))
+                for key in ('x', 'y', 'yaw')
+            )
+            and abs(float(value['x'])) <= 10000.0
+            and abs(float(value['y'])) <= 10000.0
+            and abs(float(value['yaw'])) <= math.pi + 1e-6
+        )
+
+    def process_localization_command_queue(self) -> None:
+        try:
+            command = self.localization_command_queue.get_nowait()
+        except Empty:
+            return
+        action = str(command['action'])
+        if action == 'SET_INITIAL_POSE':
+            pose = command['pose']
+            self.publish_initial_pose(
+                float(pose['x']),
+                float(pose['y']),
+                float(pose['yaw']),
+                position_uncertainty=float(command['position_uncertainty']),
+                yaw_uncertainty=float(command['yaw_uncertainty']),
+            )
+            with self.localization_lock:
+                self.localization_recovery_count += 1
+                self.localization_recovery_active = False
+                self.localization_recovery_started_monotonic = None
+                self.localization_convergence_samples = 0
+                self.localization_scan_active = False
+                self.localization_scan_started_monotonic = None
+            self.finish_localization_command(
+                command,
+                True,
+                'Initial pose published to AMCL',
+            )
+            return
+        if not self.global_localization_client.service_is_ready():
+            self.finish_localization_command(
+                command,
+                False,
+                'AMCL global localization service is unavailable',
+            )
+            return
+        future = self.global_localization_client.call_async(EmptyService.Request())
+        future.add_done_callback(
+            lambda result: self.global_localization_callback(result, command)
+        )
+
+    def global_localization_callback(
+        self,
+        future: Any,
+        command: dict[str, Any],
+    ) -> None:
+        try:
+            future.result()
+            with self.localization_lock:
+                self.localization_recovery_count += 1
+                self.localization_recovery_active = True
+                self.localization_recovery_started_monotonic = time.monotonic()
+                self.localization_convergence_samples = 0
+                self.localization_scan_active = False
+                self.localization_scan_started_monotonic = None
+            self.finish_localization_command(
+                command,
+                True,
+                'AMCL global localization started',
+            )
+        except Exception as error:
+            self.finish_localization_command(
+                command,
+                False,
+                f'AMCL global localization failed: {error}',
+            )
+
+    def finish_localization_command(
+        self,
+        command: dict[str, Any],
+        accepted: bool,
+        detail: str,
+    ) -> None:
+        payload = self.localization_snapshot()
+        payload.update({
+            'command_id': command['command_id'],
+            'command_action': command['action'],
+            'accepted': accepted,
+            'detail': detail,
+        })
+        self.active_localization_command = None
+        self.send_from_ros(payload)
+
     def enforce_mapping_deadman(self) -> None:
         should_stop = False
         with self.mapping_velocity_lock:
             if self.mapping_velocity_active and time.monotonic() >= self.mapping_velocity_deadline:
                 self.mapping_velocity_active = False
+                should_stop = True
+            if (
+                self.localization_velocity_active
+                and time.monotonic() >= self.localization_velocity_deadline
+            ):
+                self.localization_velocity_active = False
                 should_stop = True
         if should_stop:
             self.publish_zero_velocity()
