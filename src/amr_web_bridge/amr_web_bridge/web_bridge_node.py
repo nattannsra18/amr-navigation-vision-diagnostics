@@ -74,6 +74,8 @@ class WebBridgeNode(Node):
         self.declare_parameter('load_map_service', '/map_server/load_map')
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('diagnostics_topic', '/diagnostics')
+        self.declare_parameter('diagnostics_stale_after_seconds', 3.0)
+        self.declare_parameter('diagnostics_expire_after_seconds', 60.0)
         self.declare_parameter('path_topic', '/plan')
         self.declare_parameter('path_max_poses', 500)
         self.declare_parameter('path_publish_period', 0.5)
@@ -138,6 +140,22 @@ class WebBridgeNode(Node):
         )
         self.diagnostics_topic = str(
             self.get_parameter('diagnostics_topic').value
+        )
+        self.diagnostics_stale_after_seconds = max(
+            1.0,
+            float(
+                self.get_parameter(
+                    'diagnostics_stale_after_seconds'
+                ).value
+            ),
+        )
+        self.diagnostics_expire_after_seconds = max(
+            self.diagnostics_stale_after_seconds,
+            float(
+                self.get_parameter(
+                    'diagnostics_expire_after_seconds'
+                ).value
+            ),
         )
         self.path_topic = str(
             self.get_parameter('path_topic').value
@@ -890,6 +908,7 @@ class WebBridgeNode(Node):
         self,
         message: DiagnosticArray,
     ) -> None:
+        received_at = time.monotonic()
         diagnostics = {
             'type': 'diagnostics',
             'timestamp': self.diagnostic_timestamp(message),
@@ -908,14 +927,74 @@ class WebBridgeNode(Node):
                         }
                         for value in status.values
                     ],
+                    '_received_at': received_at,
                 }
                 for status in message.status
             ],
         }
 
         with self.diagnostics_lock:
+            merged_statuses = {
+                (
+                    status['name'],
+                    status['hardware_id'],
+                ): status
+                for status in (
+                    self.latest_diagnostics['statuses']
+                    if self.latest_diagnostics is not None
+                    else []
+                )
+            }
+            for status in diagnostics['statuses']:
+                merged_statuses[
+                    (status['name'], status['hardware_id'])
+                ] = status
+            diagnostics['statuses'] = list(
+                merged_statuses.values()
+            )
             self.latest_diagnostics = diagnostics
             self.diagnostics_revision += 1
+
+    def diagnostics_snapshot(
+        self,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        if self.latest_diagnostics is None:
+            return None
+
+        current_time = time.monotonic() if now is None else now
+        active_statuses = []
+        retained_statuses = []
+        for stored_status in self.latest_diagnostics['statuses']:
+            received_at = float(
+                stored_status.get('_received_at', current_time)
+            )
+            age_seconds = max(0.0, current_time - received_at)
+            if age_seconds > self.diagnostics_expire_after_seconds:
+                continue
+
+            retained_statuses.append(stored_status)
+            status = {
+                key: value
+                for key, value in stored_status.items()
+                if key != '_received_at'
+            }
+            status['values'] = [
+                dict(value) for value in stored_status['values']
+            ]
+            if age_seconds > self.diagnostics_stale_after_seconds:
+                status['level'] = 'STALE'
+                status['message'] = (
+                    'Diagnostic publisher update is stale'
+                )
+            active_statuses.append(status)
+
+        self.latest_diagnostics['statuses'] = retained_statuses
+        return {
+            'type': self.latest_diagnostics['type'],
+            'timestamp': self.latest_diagnostics['timestamp'],
+            'statuses': active_statuses,
+        }
 
     def map_callback(self, message: OccupancyGrid) -> None:
         origin = message.info.origin
@@ -1183,27 +1262,7 @@ class WebBridgeNode(Node):
 
             with self.diagnostics_lock:
                 revision = self.diagnostics_revision
-                diagnostics = (
-                    {
-                        **self.latest_diagnostics,
-                        'statuses': [
-                            {
-                                **status,
-                                'values': [
-                                    dict(value)
-                                    for value
-                                    in status['values']
-                                ],
-                            }
-                            for status
-                            in self.latest_diagnostics[
-                                'statuses'
-                            ]
-                        ],
-                    }
-                    if self.latest_diagnostics is not None
-                    else None
-                )
+                diagnostics = self.diagnostics_snapshot()
 
             if (
                 diagnostics is None
