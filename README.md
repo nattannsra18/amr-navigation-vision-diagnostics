@@ -273,6 +273,22 @@ profile expectations, and command expiry are valid. A bounded command-ID cache
 prevents a repeated WebSocket frame from repeating physical motion, and the
 Agent reports accepted/rejected, started, and succeeded/failed lifecycle states.
 
+Robot-specific ROS interfaces are selected with a parameter profile rather than
+source changes. The package includes
+`config/profiles/turtlebot3_waffle_sim.yaml` and a non-secret
+`config/profiles/scuttle_real.example.yaml` template. A physical deployment can
+start with:
+
+```bash
+ros2 run amr_web_bridge web_bridge_node --ros-args \
+  --params-file /etc/indoor-delivery-robot/robot-agent.yaml \
+  -p server_url:=wss://control.example.com
+```
+
+Use ROS remaps or edit the deployed profile if interface names differ. Motor,
+encoder, wheel, sensor-driver, and PID parameters remain in the corresponding
+hardware ROS packages and are intentionally not exposed through the web Agent.
+
 `ROBOT_WS_TOKEN` remains supported only for migration of an existing simulator.
 Do not share that token across physical robots, and disable legacy-token support
 in FastAPI after all agents are paired.

@@ -25,6 +25,10 @@ setup(
             'share/' + package_name + '/config',
             glob('config/*.yaml'),
         ),
+        (
+            'share/' + package_name + '/config/profiles',
+            glob('config/profiles/*.yaml'),
+        ),
     ],
     install_requires=[
         'setuptools',
