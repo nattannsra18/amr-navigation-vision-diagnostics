@@ -5,9 +5,9 @@
 
 <package format="3">
   <name>amr_web_bridge</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>
-    ROS 2 WebSocket bridge for AMR telemetry and web navigation commands.
+    Secure Robot Agent for ROS 2 telemetry, pairing and web navigation commands.
   </description>
 
   <maintainer email="nattanon.s184@gmail.com">

@@ -243,25 +243,45 @@ source install/setup.bash
 
 ## Run
 
-### Authenticated web bridge and software Emergency Stop
+### Secure Robot Agent pairing and software Emergency Stop
 
-Set the same random robot credential configured in FastAPI without placing it
-on a command line or URL:
+For a new robot, configure only the limited bootstrap enrollment credential.
+The agent connects outward to FastAPI, prints a short pairing code and the
+verification fingerprint, then waits for an administrator to approve it in
+**Robot Registry**. After approval, the agent claims an individual credential
+and stores it with owner-only file permissions:
 
 ```bash
-export ROBOT_WS_TOKEN='<same-random-token-as-backend>'
+export ROBOT_ENROLLMENT_TOKEN='<same-bootstrap-token-as-backend>'
 ros2 run amr_web_bridge web_bridge_node --ros-args \
   -p server_url:=ws://localhost:8000 \
-  -p robot_id:=robot01 \
+  -p robot_serial_number:=SCUTTLE-0001 \
+  -p robot_display_name:='SCUTTLE-01' \
+  -p profile_version:=scuttle-v1 \
   -p emergency_stop_cmd_vel_topic:=/cmd_vel \
   -p emergency_stop_zero_rate:=10.0
 ```
 
-The bridge sends the credential as an Authorization bearer header and does not
-log it. `/cmd_vel` is the final simulation command topic (the velocity smoother
-outputs there and the Gazebo drive plugin consumes it). While latched, the
-bridge cancels Nav2 asynchronously, drops queued navigation, rejects new goals,
-and publishes zero `Twist` at 10 Hz. Reset never replays the interrupted goal.
+The default credential path is
+`~/.config/indoor-delivery-robot/<serial>.json`; override it with
+`ROBOT_CREDENTIAL_FILE`. The agent never logs the credential. On later boots it
+reconnects automatically, sends an Agent Protocol v1 handshake, and reports
+Nav2/map/localization readiness independently from socket connectivity.
+
+Navigation commands are accepted only when the robot identity, optional map and
+profile expectations, and command expiry are valid. A bounded command-ID cache
+prevents a repeated WebSocket frame from repeating physical motion, and the
+Agent reports accepted/rejected, started, and succeeded/failed lifecycle states.
+
+`ROBOT_WS_TOKEN` remains supported only for migration of an existing simulator.
+Do not share that token across physical robots, and disable legacy-token support
+in FastAPI after all agents are paired.
+
+`/cmd_vel` is the final simulation command topic (the velocity smoother outputs
+there and the Gazebo drive plugin consumes it). While software Emergency Stop is
+latched, the agent cancels Nav2 asynchronously, drops queued navigation, rejects
+new goals, and publishes zero `Twist` at 10 Hz. Reset never replays the
+interrupted goal.
 
 Delivery previews use Nav2's `/compute_path_to_pose` action twice (robot to
 pickup and pickup to destination). The bridge returns the bounded planner paths

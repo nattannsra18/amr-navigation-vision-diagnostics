@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from datetime import datetime, timezone
 import json
 import math
 import os
+from pathlib import Path as FilePath
 from queue import Empty, Queue
 import threading
 import time
 from typing import Any
+from uuid import uuid4
 
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
@@ -33,6 +36,14 @@ from rclpy.time import Time
 from std_srvs.srv import Empty as EmptyService
 from tf2_ros import Buffer, TransformListener
 import websockets
+
+from .agent_identity import (
+    AgentCredentialStore,
+    EnrollmentClient,
+    EnrollmentError,
+    machine_fingerprint,
+    verification_fingerprint,
+)
 
 from .map_catalog import (
     available_map_yaml,
@@ -57,6 +68,14 @@ class WebBridgeNode(Node):
 
         self.declare_parameter('server_url', 'ws://localhost:8000')
         self.declare_parameter('robot_id', 'robot01')
+        self.declare_parameter('robot_serial_number', 'SIM-0001')
+        self.declare_parameter('robot_display_name', 'SCUTTLE-01 Simulator')
+        self.declare_parameter('agent_version', '0.2.0')
+        self.declare_parameter('profile_version', 'turtlebot3-waffle-sim-v1')
+        self.declare_parameter(
+            'agent_capabilities',
+            'navigation,mapping,localization,diagnostics',
+        )
         self.declare_parameter('heartbeat_period', 5.0)
         self.declare_parameter('telemetry_period', 1.0)
         self.declare_parameter('reconnect_delay', 3.0)
@@ -106,6 +125,48 @@ class WebBridgeNode(Node):
         ).rstrip('/')
         self.robot_id = str(
             self.get_parameter('robot_id').value
+        )
+        self.robot_serial_number = str(
+            self.get_parameter('robot_serial_number').value
+        ).strip()
+        self.robot_display_name = str(
+            self.get_parameter('robot_display_name').value
+        ).strip()
+        self.agent_version = str(
+            self.get_parameter('agent_version').value
+        ).strip()
+        self.profile_version = str(
+            self.get_parameter('profile_version').value
+        ).strip()
+        self.agent_capabilities = sorted({
+            item.strip().lower()
+            for item in str(
+                self.get_parameter('agent_capabilities').value
+            ).split(',')
+            if item.strip()
+        })
+        self.agent_boot_id = str(uuid4())
+        self.hardware_fingerprint = machine_fingerprint(
+            self.robot_serial_number
+        )
+        default_credential_file = (
+            FilePath.home()
+            / '.config'
+            / 'indoor-delivery-robot'
+            / f'{self.robot_serial_number}.json'
+        )
+        self.credential_store = AgentCredentialStore(FilePath(os.getenv(
+            'ROBOT_CREDENTIAL_FILE',
+            str(default_credential_file),
+        )))
+        stored_credential = self.credential_store.load()
+        self.robot_credential = os.getenv('ROBOT_AGENT_CREDENTIAL', '')
+        if stored_credential is not None:
+            self.robot_id = stored_credential.robot_id
+            self.robot_credential = stored_credential.credential
+        self.robot_enrollment_token = os.getenv(
+            'ROBOT_ENROLLMENT_TOKEN',
+            '',
         )
         self.heartbeat_period = float(
             self.get_parameter('heartbeat_period').value
@@ -268,6 +329,8 @@ class WebBridgeNode(Node):
             dict[str, Any]
         ] = Queue()
         self.pending_command_ids: set[str] = set()
+        self.processed_command_ids: OrderedDict[str, None] = OrderedDict()
+        self.processed_command_limit = 512
         self.pending_cancel_requests: dict[
             str,
             dict[str, Any],
@@ -1094,6 +1157,10 @@ class WebBridgeNode(Node):
 
         while not self.stop_requested.is_set():
             try:
+                await self.ensure_robot_identity()
+                self.websocket_uri = (
+                    f'{self.server_url}/ws/robots/{self.robot_id}'
+                )
                 self.get_logger().info('Connecting to FastAPI...')
 
                 async with websockets.connect(
@@ -1101,10 +1168,11 @@ class WebBridgeNode(Node):
                     extra_headers=(
                         {
                             'Authorization': (
-                                f'Bearer {self.robot_ws_token}'
+                                'Bearer '
+                                f'{self.robot_credential or self.robot_ws_token}'
                             )
                         }
-                        if self.robot_ws_token
+                        if self.robot_credential or self.robot_ws_token
                         else None
                     ),
                     open_timeout=5,
@@ -1113,6 +1181,8 @@ class WebBridgeNode(Node):
                 ) as websocket:
                     self.websocket = websocket
                     self.send_lock = asyncio.Lock()
+                    if self.robot_credential:
+                        await self.send_agent_hello(websocket)
                     self.get_logger().info(
                         'Connected to FastAPI WebSocket'
                     )
@@ -1142,6 +1212,9 @@ class WebBridgeNode(Node):
                         asyncio.create_task(
                             self.localization_status_loop(websocket)
                         ),
+                        asyncio.create_task(
+                            self.agent_readiness_loop(websocket)
+                        ),
                     ]
 
                     try:
@@ -1170,6 +1243,112 @@ class WebBridgeNode(Node):
                     f'Reconnecting in {self.reconnect_delay:.1f} s'
                 )
                 await asyncio.sleep(self.reconnect_delay)
+
+    async def ensure_robot_identity(self) -> None:
+        if self.robot_credential or not self.robot_enrollment_token:
+            return
+        client = EnrollmentClient(
+            self.server_url,
+            self.robot_enrollment_token,
+        )
+        payload = {
+            'serial_number': self.robot_serial_number,
+            'hardware_fingerprint': self.hardware_fingerprint,
+            'display_name': self.robot_display_name,
+            'agent_version': self.agent_version,
+            'ros_distro': os.getenv('ROS_DISTRO', 'unknown'),
+            'profile_version': self.profile_version,
+            'capabilities': self.agent_capabilities,
+        }
+        while not self.stop_requested.is_set():
+            enrollment = await asyncio.to_thread(client.create, payload)
+            self.get_logger().warning(
+                'Robot pairing required. Code: '
+                f'{enrollment.pairing_code} | Serial: '
+                f'{self.robot_serial_number} | Fingerprint: '
+                f'{verification_fingerprint(self.hardware_fingerprint)}'
+            )
+            while not self.stop_requested.is_set():
+                try:
+                    credential = await asyncio.to_thread(
+                        client.claim,
+                        enrollment.enrollment_id,
+                        enrollment.pairing_code,
+                        self.hardware_fingerprint,
+                    )
+                except EnrollmentError as error:
+                    if error.status == 409:
+                        await asyncio.sleep(enrollment.poll_after_seconds)
+                        continue
+                    if error.status == 410:
+                        self.get_logger().warning(
+                            'Pairing code expired; requesting a new code'
+                        )
+                        break
+                    raise
+                await asyncio.to_thread(
+                    self.credential_store.save,
+                    credential,
+                )
+                self.robot_id = credential.robot_id
+                self.robot_credential = credential.credential
+                self.get_logger().info(
+                    'Robot paired successfully as '
+                    f'{credential.robot_id}; credential stored securely'
+                )
+                return
+
+    async def send_agent_hello(self, websocket: Any) -> None:
+        await self.send_json(
+            websocket,
+            {
+                'type': 'agent_hello',
+                'protocol_version': '1.0',
+                'robot_id': self.robot_id,
+                'boot_id': self.agent_boot_id,
+                'agent_version': self.agent_version,
+                'ros_distro': os.getenv('ROS_DISTRO', 'unknown'),
+                'profile_version': self.profile_version,
+                'capabilities': self.agent_capabilities,
+            },
+        )
+
+    def agent_readiness_snapshot(self) -> dict[str, Any]:
+        mapping_active = self.mapping_runtime.snapshot(
+            self.map_revision
+        ).get('phase') not in {'IDLE', 'REVIEW', 'FAILED'}
+        checks = {
+            'nav2': self.navigation_client.server_is_ready(),
+            'map': self.latest_map is not None,
+            'localization': self.amcl_state == 'ACTIVE' and not mapping_active,
+        }
+        if all(checks.values()):
+            status = 'READY'
+            detail = 'Nav2, map and localization are ready'
+        elif checks['nav2'] and checks['map']:
+            status = 'DEGRADED'
+            detail = 'Navigation data is available but localization is not ready'
+        else:
+            status = 'NOT_READY'
+            detail = 'Waiting for required ROS navigation services and data'
+        return {
+            'type': 'agent_readiness',
+            'protocol_version': '1.0',
+            'robot_id': self.robot_id,
+            'status': status,
+            'checks': checks,
+            'active_map_id': self.active_map_id,
+            'detail': detail,
+            'timestamp': self.utc_timestamp(),
+        }
+
+    async def agent_readiness_loop(self, websocket: Any) -> None:
+        while not self.stop_requested.is_set():
+            await self.send_json(
+                websocket,
+                self.agent_readiness_snapshot(),
+            )
+            await asyncio.sleep(2.0)
 
     async def heartbeat_loop(self, websocket: Any) -> None:
         while not self.stop_requested.is_set():
@@ -1467,6 +1646,11 @@ class WebBridgeNode(Node):
         elif message_type == 'command_ack_received':
             self.get_logger().info(
                 'FastAPI received command acknowledgement'
+            )
+        elif message_type == 'command_status_received':
+            self.get_logger().debug(
+                'FastAPI received command lifecycle status '
+                f"{message.get('lifecycle')}"
             )
         elif message_type == 'navigation_result_received':
             self.get_logger().info(
@@ -2265,7 +2449,36 @@ class WebBridgeNode(Node):
         stage = message.get('stage')
         target = message.get('target')
 
+        rejection = self.navigation_command_rejection(message)
+        if rejection is not None:
+            await self.send_json(
+                websocket,
+                self.command_status_payload(
+                    message,
+                    'rejected',
+                    rejection,
+                ),
+            )
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'command_ack',
+                    'command_id': command_id,
+                    'accepted': False,
+                    'detail': rejection,
+                },
+            )
+            return
+
         if self.emergency_stop_latched.is_set():
+            await self.send_json(
+                websocket,
+                self.command_status_payload(
+                    message,
+                    'rejected',
+                    'Emergency Stop is latched',
+                ),
+            )
             await self.send_json(
                 websocket,
                 {
@@ -2298,6 +2511,14 @@ class WebBridgeNode(Node):
         if not valid_command:
             await self.send_json(
                 websocket,
+                self.command_status_payload(
+                    message,
+                    'rejected',
+                    'Invalid navigate_to_pose command',
+                ),
+            )
+            await self.send_json(
+                websocket,
                 {
                     'type': 'command_ack',
                     'command_id': command_id,
@@ -2316,12 +2537,27 @@ class WebBridgeNode(Node):
             duplicate = (
                 command_id == active_id
                 or command_id in self.pending_command_ids
+                or command_id in self.processed_command_ids
             )
 
             if not duplicate:
                 self.pending_command_ids.add(command_id)
+                self.processed_command_ids[command_id] = None
+                while (
+                    len(self.processed_command_ids)
+                    > self.processed_command_limit
+                ):
+                    self.processed_command_ids.popitem(last=False)
 
         if duplicate:
+            await self.send_json(
+                websocket,
+                self.command_status_payload(
+                    message,
+                    'accepted',
+                    'Command was already processed',
+                ),
+            )
             await self.send_json(
                 websocket,
                 {
@@ -2334,9 +2570,76 @@ class WebBridgeNode(Node):
             return
 
         self.command_queue.put(message)
+        await self.send_json(
+            websocket,
+            self.command_status_payload(
+                message,
+                'accepted',
+                'Command accepted into the local execution queue',
+            ),
+        )
         self.get_logger().info(
             f'Queued Nav2 command {command_id}'
         )
+
+    def navigation_command_rejection(
+        self,
+        message: dict[str, Any],
+    ) -> str | None:
+        addressed_robot = message.get('robot_id')
+        if (
+            addressed_robot is not None
+            and addressed_robot != self.robot_id
+        ):
+            return 'Command is addressed to another robot'
+
+        expected_profile = message.get('expected_profile_version')
+        if (
+            expected_profile is not None
+            and expected_profile != self.profile_version
+        ):
+            return 'Robot profile version does not match the command'
+
+        expected_map_revision = message.get('expected_map_revision')
+        if (
+            expected_map_revision is not None
+            and expected_map_revision != self.map_revision
+        ):
+            return 'Map revision does not match the command'
+
+        expires_at = message.get('expires_at')
+        if expires_at is None:
+            return None
+        if not isinstance(expires_at, str):
+            return 'Command expiry is invalid'
+
+        try:
+            normalized = expires_at.replace('Z', '+00:00')
+            expiry = datetime.fromisoformat(normalized)
+            if expiry.tzinfo is None:
+                return 'Command expiry must include a timezone'
+            if expiry <= datetime.now(timezone.utc):
+                return 'Command has expired'
+        except ValueError:
+            return 'Command expiry is invalid'
+
+        return None
+
+    def command_status_payload(
+        self,
+        command: dict[str, Any],
+        lifecycle: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        return {
+            'type': 'command_status',
+            'protocol_version': '1.0',
+            'command_id': command.get('command_id') or 'unknown',
+            'robot_id': self.robot_id,
+            'lifecycle': lifecycle,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'detail': detail,
+        }
 
     def process_cancel_queue(self) -> bool:
         try:
@@ -3103,6 +3406,11 @@ class WebBridgeNode(Node):
             True,
             'Nav2 accepted the navigation goal',
         )
+        self.send_command_status(
+            command,
+            'started',
+            'Nav2 started the navigation goal',
+        )
 
         result_future = (
             goal_handle.get_result_async()
@@ -3447,12 +3755,31 @@ class WebBridgeNode(Node):
             }
         )
 
+    def send_command_status(
+        self,
+        command: dict[str, Any],
+        lifecycle: str,
+        detail: str,
+    ) -> None:
+        self.send_from_ros(
+            self.command_status_payload(
+                command,
+                lifecycle,
+                detail,
+            )
+        )
+
     def send_navigation_result(
         self,
         command: dict[str, Any],
         status: str,
         detail: str,
     ) -> None:
+        self.send_command_status(
+            command,
+            'succeeded' if status == 'succeeded' else 'failed',
+            detail,
+        )
         self.send_from_ros(
             {
                 'type': 'navigation_result',
