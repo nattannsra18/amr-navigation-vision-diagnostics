@@ -29,6 +29,14 @@ setup(
             'share/' + package_name + '/config/profiles',
             glob('config/profiles/*.yaml'),
         ),
+        (
+            'share/' + package_name + '/deploy/systemd',
+            glob('deploy/systemd/*'),
+        ),
+        (
+            'share/' + package_name + '/deploy',
+            glob('deploy/*.example'),
+        ),
     ],
     install_requires=[
         'setuptools',

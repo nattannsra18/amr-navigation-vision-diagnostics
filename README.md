@@ -289,6 +289,33 @@ Use ROS remaps or edit the deployed profile if interface names differ. Motor,
 encoder, wheel, sensor-driver, and PID parameters remain in the corresponding
 hardware ROS packages and are intentionally not exposed through the web Agent.
 
+### Start the Agent automatically on a robot
+
+The package includes a hardened systemd template under `deploy/systemd` and a
+non-secret environment example under `deploy`. On the robot SBC:
+
+1. Create a dedicated `indoor-robot` system user.
+2. Install the workspace at the path configured by `ROBOT_WORKSPACE`.
+3. Copy a completed robot profile to
+   `/etc/indoor-delivery-robot/robot-agent.yaml`.
+4. Copy `robot-agent.env.example` to
+   `/etc/indoor-delivery-robot/agent.env`, replace its placeholders, and set
+   owner-only permissions (`chmod 600`).
+5. Install the service as
+   `/etc/systemd/system/indoor-delivery-robot-agent.service`, then enable it.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now indoor-delivery-robot-agent.service
+sudo journalctl -u indoor-delivery-robot-agent.service -f
+```
+
+The first journal session shows the pairing code. After an administrator
+approves it, the credential is written under `/var/lib/indoor-delivery-robot`
+and subsequent boots reconnect without operator input. The service deliberately
+does not grant access to hardware configuration or replace the physical safety
+controller.
+
 `ROBOT_WS_TOKEN` remains supported only for migration of an existing simulator.
 Do not share that token across physical robots, and disable legacy-token support
 in FastAPI after all agents are paired.
