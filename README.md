@@ -17,6 +17,7 @@ A simulation-based Autonomous Mobile Robot (AMR) project built with ROS 2 Jazzy,
 - Interactive automated runtime verification
 - ROS 2 simulation time and Gazebo-to-ROS sensor bridges
 - Clean-clone dependency, build, and test validation
+- Headless three-agent Fleet Lab for pairing and multi-robot control-plane tests
 
 ## Demo Video
 
@@ -216,6 +217,53 @@ A successful build should report:
 ```text
 Summary: 5 packages finished
 ```
+
+## Multi-Robot Fleet Lab
+
+The Fleet Lab runs three independent headless Robot Agents on one computer. It
+uses the real enrollment and Agent Protocol WebSocket endpoints, while simulated
+navigation results remove the need to run three Gazebo/Nav2 stacks.
+
+| Agent | Serial | ROS namespace | Active map | Capabilities |
+|---|---|---|---|---|
+| `sim01` | `FLEET-SIM-0001` | `/sim01` | `warehouse_map` | navigation, mapping, localization, diagnostics |
+| `sim02` | `FLEET-SIM-0002` | `/sim02` | `warehouse_map` | navigation, localization, diagnostics |
+| `robot-test01` | `FLEET-TEST-0001` | `/robot_test01` | `lab_map` | localization, diagnostics |
+
+Start the FastAPI/web stack first, then run:
+
+```bash
+cd ~/amr-navigation-vision-diagnostics
+./scripts/fleet_lab.sh start
+./scripts/fleet_lab.sh status
+```
+
+Open `http://localhost:3000/robots` and approve the three pairing requests.
+Each agent stores its issued credential in a separate file under
+`~/.local/state/indoor-delivery-fleet-lab/credentials/`.
+
+Useful failure and recovery scenarios:
+
+```bash
+# Simulate one robot going offline during a mission.
+./scripts/fleet_lab.sh stop sim01
+./scripts/fleet_lab.sh start sim01
+
+# Follow one agent log, including pairing and reconnect events.
+./scripts/fleet_lab.sh logs sim02
+
+# After revoking sim02 in Robot Registry, remove only its local credential
+# before requesting a fresh pairing.
+./scripts/fleet_lab.sh reset-credentials sim02
+./scripts/fleet_lab.sh start sim02
+
+# Stop the whole lab.
+./scripts/fleet_lab.sh stop
+```
+
+Use `sim01` and `sim02` to verify explicit and automatic task dispatch on
+`warehouse_map`. `robot-test01` intentionally has another map and no navigation
+capability, so the delivery UI must not offer it as an eligible delivery robot.
 
 Source both setup files in every new terminal:
 

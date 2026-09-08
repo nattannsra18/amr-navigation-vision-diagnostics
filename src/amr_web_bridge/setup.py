@@ -30,6 +30,10 @@ setup(
             glob('config/profiles/*.yaml'),
         ),
         (
+            'share/' + package_name + '/config/fleet_lab',
+            glob('config/fleet_lab/*.yaml'),
+        ),
+        (
             'share/' + package_name + '/deploy/systemd',
             glob('deploy/systemd/*'),
         ),
@@ -45,8 +49,8 @@ setup(
     maintainer='nattanns18',
     maintainer_email='nattann.sra18@gmail.com',
     description=(
-        'WebSocket Robot Agent connecting the simulated '
-        'ROS 2 AMR to the FastAPI control plane.'
+        'WebSocket Robot Agent connecting ROS 2 AMRs '
+        'to the FastAPI control plane.'
     ),
     license='Apache-2.0',
     tests_require=[
@@ -57,6 +61,10 @@ setup(
             (
                 'web_bridge_node = '
                 'amr_web_bridge.web_bridge_node:main'
+            ),
+            (
+                'fleet_agent_simulator = '
+                'amr_web_bridge.fleet_agent_simulator:main'
             ),
         ],
     },
