@@ -1,0 +1,51 @@
+from amr_web_bridge.profile_validator import validate_robot_profile
+
+
+def healthy_observation():
+    return {
+        'navigate_action': True,
+        'navigate_action_name': '/navigate_to_pose',
+        'compute_path_action': True,
+        'compute_path_action_name': '/compute_path_to_pose',
+        'odom_age_seconds': 0.2,
+        'amcl_pose_age_seconds': 0.3,
+        'map_age_seconds': 12.0,
+        'diagnostics_age_seconds': 0.4,
+        'tf_map_to_odom': True,
+        'tf_odom_to_base': True,
+        'amcl_state': 'ACTIVE',
+        'global_localization_service': True,
+        'global_localization_service_name': '/reinitialize_global_localization',
+        'maps_directory': '/var/lib/robot/maps',
+        'load_map_service': True,
+        'load_map_service_name': '/map_server/load_map',
+    }
+
+
+def test_all_declared_interfaces_produce_a_ready_report():
+    report = validate_robot_profile(
+        ['navigation', 'localization', 'mapping', 'diagnostics'],
+        healthy_observation(),
+    )
+    assert report['status'] == 'READY'
+    assert all(item['status'] == 'PASS' for item in report['checks'])
+    assert {item['category'] for item in report['checks']} == {
+        'INTERFACE', 'DATA', 'TF', 'LIFECYCLE', 'CAPABILITY'
+    }
+
+
+def test_missing_required_interface_and_stale_data_are_not_ready():
+    observation = healthy_observation()
+    observation['navigate_action'] = False
+    observation['odom_age_seconds'] = 8.0
+    report = validate_robot_profile(['navigation'], observation)
+    failed = {item['check_id'] for item in report['checks'] if item['status'] == 'FAIL'}
+    assert report['status'] == 'NOT_READY'
+    assert {'interface.navigate_action', 'data.odom'} <= failed
+
+
+def test_unknown_capability_is_degraded_instead_of_silently_accepted():
+    report = validate_robot_profile(['experimental_sensor'], healthy_observation())
+    assert report['status'] == 'DEGRADED'
+    assert report['checks'][0]['check_id'] == 'capability.experimental_sensor'
+    assert report['checks'][0]['status'] == 'WARN'

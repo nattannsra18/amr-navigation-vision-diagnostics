@@ -59,6 +59,7 @@ from .path_utils import (
     serialize_path,
     serialize_preview_path,
 )
+from .profile_validator import validate_robot_profile
 
 
 class WebBridgeNode(Node):
@@ -95,6 +96,8 @@ class WebBridgeNode(Node):
         self.declare_parameter('diagnostics_topic', '/diagnostics')
         self.declare_parameter('diagnostics_stale_after_seconds', 3.0)
         self.declare_parameter('diagnostics_expire_after_seconds', 60.0)
+        self.declare_parameter('profile_data_freshness_seconds', 3.0)
+        self.declare_parameter('base_frame', 'base_footprint')
         self.declare_parameter('path_topic', '/plan')
         self.declare_parameter('path_max_poses', 500)
         self.declare_parameter('path_publish_period', 0.5)
@@ -309,6 +312,9 @@ class WebBridgeNode(Node):
         self.latest_velocity: (
             dict[str, float] | None
         ) = None
+        self.last_map_monotonic: float | None = None
+        self.last_odom_monotonic: float | None = None
+        self.last_diagnostics_monotonic: float | None = None
         self.map_revision = 0
         self.diagnostics_revision = 0
         self.node_started_monotonic = time.monotonic()
@@ -361,6 +367,11 @@ class WebBridgeNode(Node):
         )
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.profile_data_freshness_seconds = max(
+            0.5,
+            float(self.get_parameter('profile_data_freshness_seconds').value),
+        )
+        self.base_frame = str(self.get_parameter('base_frame').value).strip() or 'base_footprint'
         self.mapping_velocity_deadline = 0.0
         self.mapping_velocity_active = False
         self.localization_velocity_deadline = 0.0
@@ -627,6 +638,7 @@ class WebBridgeNode(Node):
                 'linear_velocity': linear_velocity,
                 'angular_velocity': angular_velocity,
             }
+            self.last_odom_monotonic = time.monotonic()
 
     def update_mapping_pose(self) -> None:
         snapshot = self.mapping_runtime.snapshot(self.map_revision)
@@ -1017,6 +1029,7 @@ class WebBridgeNode(Node):
             )
             self.latest_diagnostics = diagnostics
             self.diagnostics_revision += 1
+            self.last_diagnostics_monotonic = received_at
 
     def diagnostics_snapshot(
         self,
@@ -1091,6 +1104,7 @@ class WebBridgeNode(Node):
         with self.map_lock:
             self.latest_map = map_payload
             self.map_revision += 1
+            self.last_map_monotonic = time.monotonic()
 
         self.get_logger().info(
             'Received ROS map '
@@ -1314,31 +1328,79 @@ class WebBridgeNode(Node):
         )
 
     def agent_readiness_snapshot(self) -> dict[str, Any]:
+        now = time.monotonic()
         mapping_active = self.mapping_runtime.snapshot(
             self.map_revision
         ).get('phase') not in {'IDLE', 'REVIEW', 'FAILED'}
+        with self.map_lock:
+            map_age = (
+                now - self.last_map_monotonic
+                if self.last_map_monotonic is not None else None
+            )
+        with self.velocity_lock:
+            odom_age = (
+                now - self.last_odom_monotonic
+                if self.last_odom_monotonic is not None else None
+            )
+        with self.localization_lock:
+            pose_age = (
+                now - self.last_localization_monotonic
+                if self.last_localization_monotonic is not None else None
+            )
+            amcl_state = self.amcl_state
+        with self.diagnostics_lock:
+            diagnostics_age = (
+                now - self.last_diagnostics_monotonic
+                if self.last_diagnostics_monotonic is not None else None
+            )
+
+        def transform_available(target: str, source: str) -> bool:
+            try:
+                return self.tf_buffer.can_transform(target, source, Time())
+            except Exception:
+                return False
+
+        report = validate_robot_profile(
+            self.agent_capabilities,
+            {
+                'navigate_action': self.navigation_client.server_is_ready(),
+                'navigate_action_name': self.navigate_action,
+                'compute_path_action': self.preview_client.server_is_ready(),
+                'compute_path_action_name': self.compute_path_action,
+                'odom_age_seconds': odom_age,
+                'amcl_pose_age_seconds': pose_age,
+                'map_age_seconds': map_age,
+                'diagnostics_age_seconds': diagnostics_age,
+                'tf_map_to_odom': transform_available('map', 'odom'),
+                'tf_odom_to_base': transform_available(
+                    'odom', self.base_frame
+                ),
+                'amcl_state': 'INACTIVE' if mapping_active else amcl_state,
+                'global_localization_service': (
+                    self.global_localization_client.service_is_ready()
+                ),
+                'global_localization_service_name': (
+                    self.global_localization_service
+                ),
+                'maps_directory': self.maps_directory,
+                'load_map_service': self.load_map_client.service_is_ready(),
+                'load_map_service_name': self.load_map_service,
+            },
+            freshness_seconds=self.profile_data_freshness_seconds,
+        )
         checks = {
-            'nav2': self.navigation_client.server_is_ready(),
-            'map': self.latest_map is not None,
-            'localization': self.amcl_state == 'ACTIVE' and not mapping_active,
+            item['check_id']: item['status'] == 'PASS'
+            for item in report['checks']
         }
-        if all(checks.values()):
-            status = 'READY'
-            detail = 'Nav2, map and localization are ready'
-        elif checks['nav2'] and checks['map']:
-            status = 'DEGRADED'
-            detail = 'Navigation data is available but localization is not ready'
-        else:
-            status = 'NOT_READY'
-            detail = 'Waiting for required ROS navigation services and data'
         return {
             'type': 'agent_readiness',
             'protocol_version': '1.0',
             'robot_id': self.robot_id,
-            'status': status,
+            'status': report['status'],
             'checks': checks,
+            'validation_results': report['checks'],
             'active_map_id': self.active_map_id,
-            'detail': detail,
+            'detail': report['detail'],
             'timestamp': self.utc_timestamp(),
         }
 

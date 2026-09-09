@@ -234,12 +234,29 @@ class FleetAgentSimulator:
             })
 
     async def _send_readiness(self, websocket: Any) -> None:
+        validation_results = [
+            {
+                'check_id': 'capability.fleet_lab_profile',
+                'category': 'CAPABILITY',
+                'status': 'PASS',
+                'message': 'Fleet Lab profile is configured',
+                'observed': self.profile.profile_version,
+            },
+            {
+                'check_id': 'data.map',
+                'category': 'DATA',
+                'status': 'PASS',
+                'message': 'Simulated active map is configured',
+                'observed': self.profile.active_map_id,
+            },
+        ]
         await self._send(websocket, {
             'type': 'agent_readiness',
             'protocol_version': '1.0',
             'robot_id': self.robot_id,
             'status': 'READY',
             'checks': {'nav2': True, 'map': True, 'localization': True},
+            'validation_results': validation_results,
             'active_map_id': self.profile.active_map_id,
             'detail': f'Fleet Lab ready in ROS namespace {self.profile.ros_namespace}',
             'timestamp': utc_timestamp(),
