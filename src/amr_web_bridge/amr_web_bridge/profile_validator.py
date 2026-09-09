@@ -125,12 +125,35 @@ def validate_robot_profile(
                 if scan_age is None else f'{float(scan_age):.2f} s old'
             ),
         )
-    fresh(
-        'data.amcl_pose',
-        'localization',
-        'amcl_pose_age_seconds',
-        'AMCL pose topic',
-    )
+    if 'localization' in declared:
+        pose_age = observation.get('amcl_pose_age_seconds')
+        pose_received = (
+            isinstance(pose_age, (int, float))
+            and float(pose_age) >= 0
+        )
+        pose_fresh = (
+            pose_received
+            and (
+                float(pose_age) <= freshness_seconds
+                or not bool(observation.get('robot_moving'))
+            )
+        )
+        add(
+            'data.amcl_pose',
+            'DATA',
+            pose_fresh,
+            (
+                'AMCL pose topic is fresh'
+                if pose_received and float(pose_age) <= freshness_seconds
+                else 'AMCL pose remains valid while the robot is stationary'
+                if pose_fresh
+                else 'AMCL pose topic has no fresh data'
+            ),
+            observed=(
+                'never received'
+                if pose_age is None else f'{float(pose_age):.2f} s old'
+            ),
+        )
 
     if declared & {'navigation', 'localization'}:
         for check_id, key, label in (

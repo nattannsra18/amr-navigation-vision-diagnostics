@@ -1479,6 +1479,14 @@ class WebBridgeNode(Node):
                 now - self.last_odom_monotonic
                 if self.last_odom_monotonic is not None else None
             )
+            velocity = dict(self.latest_velocity) if self.latest_velocity else None
+        robot_moving = bool(
+            velocity
+            and (
+                abs(float(velocity.get('linear_velocity', 0.0))) > 0.02
+                or abs(float(velocity.get('angular_velocity', 0.0))) > 0.02
+            )
+        )
         scan_age = (
             now - self.last_scan_monotonic
             if self.last_scan_monotonic is not None else None
@@ -1520,6 +1528,7 @@ class WebBridgeNode(Node):
                 'odom_age_seconds': odom_age,
                 'scan_age_seconds': scan_age,
                 'amcl_pose_age_seconds': pose_age,
+                'robot_moving': robot_moving,
                 'map_age_seconds': map_age,
                 'diagnostics_age_seconds': diagnostics_age,
                 'tf_map_to_odom': transform_available('map', 'odom'),

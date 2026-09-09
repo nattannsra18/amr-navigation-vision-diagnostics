@@ -10,6 +10,7 @@ def healthy_observation():
         'odom_age_seconds': 0.2,
         'scan_age_seconds': 0.2,
         'amcl_pose_age_seconds': 0.3,
+        'robot_moving': False,
         'map_age_seconds': 12.0,
         'diagnostics_age_seconds': 0.4,
         'tf_map_to_odom': True,
@@ -43,6 +44,21 @@ def test_missing_required_interface_and_stale_data_are_not_ready():
     failed = {item['check_id'] for item in report['checks'] if item['status'] == 'FAIL'}
     assert report['status'] == 'NOT_READY'
     assert {'interface.navigate_action', 'data.odom'} <= failed
+
+
+def test_stationary_amcl_pose_remains_valid_but_moving_pose_must_be_fresh():
+    observation = healthy_observation()
+    observation['amcl_pose_age_seconds'] = 30.0
+    stationary = validate_robot_profile(['localization'], observation)
+    assert stationary['status'] == 'READY'
+
+    observation['robot_moving'] = True
+    moving = validate_robot_profile(['localization'], observation)
+    assert moving['status'] == 'NOT_READY'
+    assert next(
+        item for item in moving['checks']
+        if item['check_id'] == 'data.amcl_pose'
+    )['status'] == 'FAIL'
 
 
 def test_unknown_capability_is_degraded_instead_of_silently_accepted():
