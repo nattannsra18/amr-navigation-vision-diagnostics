@@ -265,6 +265,54 @@ Use `sim01` and `sim02` to verify explicit and automatic task dispatch on
 `warehouse_map`. `robot-test01` intentionally has another map and no navigation
 capability, so the delivery UI must not offer it as an eligible delivery robot.
 
+## Robot Agent Installer
+
+Prepare a robot-specific profile from
+`src/amr_web_bridge/config/profiles/scuttle_real.example.yaml`. Replace the
+serial number, verify every ROS interface name, and keep motor, encoder and
+sensor-driver settings in their owning ROS packages.
+
+Run a non-mutating preflight first. The enrollment token file should contain
+only the limited bootstrap token and should be readable only by its owner.
+
+```bash
+chmod 600 ~/robot-enrollment-token
+
+./scripts/install_robot_agent.sh \
+  --profile ~/robot-agent.yaml \
+  --control-url wss://control.example.com \
+  --registry-url https://control.example.com/robots \
+  --enrollment-token-file ~/robot-enrollment-token \
+  --dry-run
+```
+
+Install and start the Agent after the preflight succeeds:
+
+```bash
+sudo ./scripts/install_robot_agent.sh \
+  --profile ~/robot-agent.yaml \
+  --control-url wss://control.example.com \
+  --registry-url https://control.example.com/robots \
+  --enrollment-token-file ~/robot-enrollment-token
+```
+
+The installer builds a relocatable Agent workspace under `/opt`, creates the
+unprivileged `indoor-robot` system account, installs protected configuration and
+credential directories, enables the hardened systemd service, and prints the
+Robot Registry URL and pairing information. It does not install ROS itself or
+change hardware-driver configuration.
+
+After the administrator approves pairing and the credential file appears,
+remove `ROBOT_ENROLLMENT_TOKEN` from `/etc/indoor-delivery-robot/agent.env` and
+restart the service. The per-robot credential remains in
+`/var/lib/indoor-delivery-robot/agent-credential.json`.
+
+```bash
+sudo systemctl restart indoor-delivery-robot-agent.service
+sudo systemctl status indoor-delivery-robot-agent.service
+sudo journalctl -u indoor-delivery-robot-agent.service -f
+```
+
 Source both setup files in every new terminal:
 
 ```bash
