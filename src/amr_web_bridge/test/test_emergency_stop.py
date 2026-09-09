@@ -27,6 +27,7 @@ class Goal:
 def bridge():
     value = SimpleNamespace(
         emergency_stop_latched=threading.Event(),
+        physical_estop_latched=threading.Event(),
         last_emergency_command_id=None,
         command_queue=Queue(),
         command_lock=threading.Lock(),
@@ -47,6 +48,7 @@ def bridge():
     value.clear_command_queue = lambda: WebBridgeNode.clear_command_queue(value)
     value.publish_zero_velocity = lambda: WebBridgeNode.publish_zero_velocity(value)
     value.publish_emergency_zero = lambda: WebBridgeNode.publish_emergency_zero(value)
+    value.motion_stop_latched = lambda: WebBridgeNode.motion_stop_latched(value)
     value.navigation_command_rejection = (
         lambda message: WebBridgeNode.navigation_command_rejection(value, message)
     )
@@ -107,6 +109,19 @@ def test_navigation_is_rejected_while_latched():
     assert value.command_queue.empty()
     assert value.sent[-1]['accepted'] is False
     assert 'latched' in value.sent[-1]['detail']
+
+
+def test_navigation_is_rejected_while_physical_estop_is_latched():
+    value = bridge()
+    value.physical_estop_latched.set()
+    message = {
+        'command_id': 'task:pickup:id', 'command': 'navigate_to_pose',
+        'task_id': 'task', 'stage': 'pickup',
+        'target': {'frame_id': 'map', 'x': 1.0, 'y': 2.0, 'yaw': 0.0},
+    }
+    asyncio.run(WebBridgeNode.queue_navigation_command(value, object(), message))
+    assert value.command_queue.empty()
+    assert value.sent[-1]['accepted'] is False
 
 
 def test_reset_clears_only_latch_and_never_replays_old_goal():

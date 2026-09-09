@@ -33,6 +33,8 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 from rclpy.time import Time
+from sensor_msgs.msg import BatteryState, LaserScan
+from std_msgs.msg import Bool
 from std_srvs.srv import Empty as EmptyService
 from tf2_ros import Buffer, TransformListener
 import websockets
@@ -94,6 +96,14 @@ class WebBridgeNode(Node):
         self.declare_parameter('map_catalog_period', 10.0)
         self.declare_parameter('load_map_service', '/map_server/load_map')
         self.declare_parameter('odom_topic', '/odom')
+        self.declare_parameter('scan_topic', '/scan')
+        self.declare_parameter('battery_topic', '/battery_state')
+        self.declare_parameter(
+            'physical_estop_topic',
+            '/safety/physical_estop',
+        )
+        self.declare_parameter('physical_estop_stale_seconds', 2.0)
+        self.declare_parameter('hardware_contract_mode', 'simulation')
         self.declare_parameter('diagnostics_topic', '/diagnostics')
         self.declare_parameter('diagnostics_stale_after_seconds', 3.0)
         self.declare_parameter('diagnostics_expire_after_seconds', 60.0)
@@ -207,6 +217,28 @@ class WebBridgeNode(Node):
         self.odom_topic = str(
             self.get_parameter('odom_topic').value
         )
+        self.scan_topic = str(
+            self.get_parameter('scan_topic').value
+        )
+        self.battery_topic = str(
+            self.get_parameter('battery_topic').value
+        )
+        self.physical_estop_topic = str(
+            self.get_parameter('physical_estop_topic').value
+        )
+        self.physical_estop_stale_seconds = max(
+            0.1,
+            float(
+                self.get_parameter('physical_estop_stale_seconds').value
+            ),
+        )
+        self.hardware_contract_mode = str(
+            self.get_parameter('hardware_contract_mode').value
+        ).strip().lower()
+        if self.hardware_contract_mode not in {'physical', 'simulation'}:
+            raise ValueError(
+                'hardware_contract_mode must be physical or simulation'
+            )
         self.diagnostics_topic = str(
             self.get_parameter('diagnostics_topic').value
         )
@@ -242,8 +274,14 @@ class WebBridgeNode(Node):
                 self.get_parameter('path_publish_period').value
             ),
         )
-        self.battery_percent = int(
-            self.get_parameter('battery_percent').value
+        self.battery_percent = min(
+            100,
+            max(0, int(self.get_parameter('battery_percent').value)),
+        )
+        self.battery_source = (
+            'UNAVAILABLE'
+            if self.hardware_contract_mode == 'physical'
+            else 'SIMULATED'
         )
         self.navigate_action = str(
             self.get_parameter('navigate_action').value
@@ -310,6 +348,7 @@ class WebBridgeNode(Node):
         self.mapping_velocity_lock = threading.Lock()
         self.localization_lock = threading.Lock()
         self.emergency_stop_latched = threading.Event()
+        self.physical_estop_latched = threading.Event()
         self.last_emergency_command_id: str | None = None
         self.latest_telemetry: dict[str, Any] | None = None
         self.latest_map: dict[str, Any] | None = None
@@ -319,6 +358,9 @@ class WebBridgeNode(Node):
         ) = None
         self.last_map_monotonic: float | None = None
         self.last_odom_monotonic: float | None = None
+        self.last_scan_monotonic: float | None = None
+        self.last_battery_monotonic: float | None = None
+        self.last_physical_estop_monotonic: float | None = None
         self.last_diagnostics_monotonic: float | None = None
         self.map_revision = 0
         self.diagnostics_revision = 0
@@ -422,6 +464,30 @@ class WebBridgeNode(Node):
             self.odom_callback,
             self.odom_qos,
         )
+        self.scan_subscription = self.create_subscription(
+            LaserScan,
+            self.scan_topic,
+            self.scan_callback,
+            self.odom_qos,
+        )
+        self.safety_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.battery_subscription = self.create_subscription(
+            BatteryState,
+            self.battery_topic,
+            self.battery_callback,
+            self.safety_qos,
+        )
+        self.physical_estop_subscription = self.create_subscription(
+            Bool,
+            self.physical_estop_topic,
+            self.physical_estop_callback,
+            self.safety_qos,
+        )
         self.diagnostics_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
@@ -501,6 +567,10 @@ class WebBridgeNode(Node):
         self.emergency_zero_timer = self.create_timer(
             1.0 / self.emergency_stop_zero_rate,
             self.publish_emergency_zero,
+        )
+        self.physical_estop_watchdog_timer = self.create_timer(
+            0.2,
+            self.enforce_physical_estop_watchdog,
         )
         self.mapping_deadman_timer = self.create_timer(
             0.05,
@@ -585,14 +655,13 @@ class WebBridgeNode(Node):
         )
         yaw = math.atan2(sin_yaw, cos_yaw)
 
+        battery, battery_source = self.current_battery_state()
         telemetry = {
             'x': float(pose.position.x),
             'y': float(pose.position.y),
             'yaw': float(yaw),
-            'battery': self.battery_percent,
-            # Gazebo currently has no BatteryState source. Keep the configured
-            # charge visible for simulation while explicitly identifying it.
-            'battery_source': 'SIMULATED',
+            'battery': battery,
+            'battery_source': battery_source,
             'frame_id': message.header.frame_id or 'map',
             'timestamp': self.utc_timestamp(),
         }
@@ -645,6 +714,65 @@ class WebBridgeNode(Node):
             }
             self.last_odom_monotonic = time.monotonic()
 
+    def scan_callback(self, _message: LaserScan) -> None:
+        self.last_scan_monotonic = time.monotonic()
+
+    def battery_callback(self, message: BatteryState) -> None:
+        percentage = float(message.percentage)
+        if not math.isfinite(percentage) or not 0.0 <= percentage <= 1.0:
+            return
+        with self.telemetry_lock:
+            self.battery_percent = round(percentage * 100.0)
+            self.battery_source = 'SENSOR'
+            self.last_battery_monotonic = time.monotonic()
+
+    def current_battery_state(self) -> tuple[int, str]:
+        with self.telemetry_lock:
+            return self.battery_percent, self.battery_source
+
+    def physical_estop_callback(self, message: Bool) -> None:
+        self.last_physical_estop_monotonic = time.monotonic()
+        if bool(message.data):
+            self.latch_physical_estop()
+            return
+        self.physical_estop_latched.clear()
+        self.publish_zero_velocity()
+
+    def latch_physical_estop(self) -> None:
+        was_latched = self.physical_estop_latched.is_set()
+        self.physical_estop_latched.set()
+        self.publish_emergency_zero()
+        if was_latched:
+            return
+        self.clear_command_queue()
+        self.clear_navigation_path(send_clear=True, force=True)
+        with self.command_lock:
+            goal_handle = self.active_goal_handle
+            self.active_command = None
+            self.active_goal_handle = None
+            self.pending_command_ids.clear()
+            self.pending_cancel_requests.clear()
+        if goal_handle is not None:
+            try:
+                goal_handle.cancel_goal_async()
+            except Exception as error:
+                self.get_logger().error(
+                    'Physical Emergency Stop Nav2 cancellation failed: '
+                    f'{error}'
+                )
+
+    def enforce_physical_estop_watchdog(self) -> None:
+        if self.hardware_contract_mode != 'physical':
+            return
+        last_update = self.last_physical_estop_monotonic
+        if (
+            last_update is not None
+            and time.monotonic() - last_update
+            <= self.physical_estop_stale_seconds
+        ):
+            return
+        self.latch_physical_estop()
+
     def update_mapping_pose(self) -> None:
         snapshot = self.mapping_runtime.snapshot(self.map_revision)
         if snapshot.get('phase') not in {'MAPPING', 'STOPPING', 'REVIEW'}:
@@ -653,7 +781,7 @@ class WebBridgeNode(Node):
         try:
             transform = self.tf_buffer.lookup_transform(
                 'map',
-                'base_footprint',
+                self.base_frame,
                 Time(),
             )
         except Exception:
@@ -669,12 +797,13 @@ class WebBridgeNode(Node):
             orientation.y * orientation.y
             + orientation.z * orientation.z
         )
+        battery, battery_source = self.current_battery_state()
         telemetry = {
             'x': float(translation.x),
             'y': float(translation.y),
             'yaw': float(math.atan2(sin_yaw, cos_yaw)),
-            'battery': self.battery_percent,
-            'battery_source': 'SIMULATED',
+            'battery': battery,
+            'battery_source': battery_source,
             'frame_id': 'map',
             'timestamp': self.utc_timestamp(),
         }
@@ -709,8 +838,8 @@ class WebBridgeNode(Node):
     def capture_mapping_pose_reference(self) -> None:
         try:
             self.mapping_pose_reference = (
-                self.lookup_planar_pose('map', 'base_footprint'),
-                self.lookup_planar_pose('odom', 'base_footprint'),
+                self.lookup_planar_pose('map', self.base_frame),
+                self.lookup_planar_pose('odom', self.base_frame),
             )
         except Exception:
             self.mapping_pose_reference = None
@@ -1350,6 +1479,19 @@ class WebBridgeNode(Node):
                 now - self.last_odom_monotonic
                 if self.last_odom_monotonic is not None else None
             )
+        scan_age = (
+            now - self.last_scan_monotonic
+            if self.last_scan_monotonic is not None else None
+        )
+        with self.telemetry_lock:
+            battery_age = (
+                now - self.last_battery_monotonic
+                if self.last_battery_monotonic is not None else None
+            )
+        physical_estop_age = (
+            now - self.last_physical_estop_monotonic
+            if self.last_physical_estop_monotonic is not None else None
+        )
         with self.localization_lock:
             pose_age = (
                 now - self.last_localization_monotonic
@@ -1376,6 +1518,7 @@ class WebBridgeNode(Node):
                 'compute_path_action': self.preview_client.server_is_ready(),
                 'compute_path_action_name': self.compute_path_action,
                 'odom_age_seconds': odom_age,
+                'scan_age_seconds': scan_age,
                 'amcl_pose_age_seconds': pose_age,
                 'map_age_seconds': map_age,
                 'diagnostics_age_seconds': diagnostics_age,
@@ -1393,6 +1536,12 @@ class WebBridgeNode(Node):
                 'maps_directory': self.maps_directory,
                 'load_map_service': self.load_map_client.service_is_ready(),
                 'load_map_service_name': self.load_map_service,
+                'hardware_contract_mode': self.hardware_contract_mode,
+                'battery_age_seconds': battery_age,
+                'physical_estop_age_seconds': physical_estop_age,
+                'physical_estop_latched': (
+                    self.physical_estop_latched.is_set()
+                ),
             },
             freshness_seconds=self.profile_data_freshness_seconds,
         )
@@ -1854,7 +2003,7 @@ class WebBridgeNode(Node):
                         self.active_map_command is not None
                         or not self.map_command_queue.empty()
                     )
-                if self.emergency_stop_latched.is_set():
+                if self.motion_stop_latched():
                     raise ValueError('Emergency Stop is latched')
                 if (
                     navigation_active
@@ -1903,7 +2052,7 @@ class WebBridgeNode(Node):
             message.get('robot_id') == self.robot_id
             and message.get('session_id') == snapshot.get('session_id')
             and snapshot.get('phase') == 'MAPPING'
-            and not self.emergency_stop_latched.is_set()
+            and not self.motion_stop_latched()
             and isinstance(linear_x, (int, float))
             and not isinstance(linear_x, bool)
             and isinstance(angular_z, (int, float))
@@ -1968,7 +2117,7 @@ class WebBridgeNode(Node):
             or map_operation_active
             or mapping_active
             or self.active_localization_command is not None
-            or self.emergency_stop_latched.is_set()
+            or self.motion_stop_latched()
         )
         if not valid or blocked:
             detail = (
@@ -2010,7 +2159,7 @@ class WebBridgeNode(Node):
             and not scan_active
             and not navigation_active
             and not mapping_active
-            and not self.emergency_stop_latched.is_set()
+            and not self.motion_stop_latched()
             and isinstance(linear_x, (int, float))
             and not isinstance(linear_x, bool)
             and isinstance(angular_z, (int, float))
@@ -2066,7 +2215,7 @@ class WebBridgeNode(Node):
             not recovery_active
             or navigation_active
             or mapping_active
-            or self.emergency_stop_latched.is_set()
+            or self.motion_stop_latched()
         ):
             self.get_logger().warning('Rejected unsafe localization scan command')
             return
@@ -2095,7 +2244,7 @@ class WebBridgeNode(Node):
             or navigation_active
             or mapping_active
             or timed_out
-            or self.emergency_stop_latched.is_set()
+            or self.motion_stop_latched()
         ):
             with self.localization_lock:
                 self.localization_scan_active = False
@@ -2574,8 +2723,14 @@ class WebBridgeNode(Node):
     def publish_zero_velocity(self) -> None:
         self.emergency_velocity_publisher.publish(Twist())
 
+    def motion_stop_latched(self) -> bool:
+        physical_latch = getattr(self, 'physical_estop_latched', None)
+        return self.emergency_stop_latched.is_set() or (
+            physical_latch is not None and physical_latch.is_set()
+        )
+
     def publish_emergency_zero(self) -> None:
-        if self.emergency_stop_latched.is_set():
+        if self.motion_stop_latched():
             self.publish_zero_velocity()
 
     async def queue_navigation_command(
@@ -2610,7 +2765,7 @@ class WebBridgeNode(Node):
             )
             return
 
-        if self.emergency_stop_latched.is_set():
+        if self.motion_stop_latched():
             await self.send_json(
                 websocket,
                 self.command_status_payload(
@@ -3341,7 +3496,7 @@ class WebBridgeNode(Node):
             ):
                 return
 
-        if self.emergency_stop_latched.is_set():
+        if self.motion_stop_latched():
             self.clear_command_queue()
             return
 
@@ -4013,9 +4168,11 @@ class WebBridgeNode(Node):
     def destroy_node(self) -> bool:
         self.stop_requested.set()
         self.emergency_stop_latched.clear()
+        self.physical_estop_latched.clear()
         self.mapping_runtime.shutdown()
         self.destroy_timer(self.preview_timer)
         self.destroy_timer(self.emergency_zero_timer)
+        self.destroy_timer(self.physical_estop_watchdog_timer)
         self.destroy_timer(self.mapping_deadman_timer)
         self.destroy_timer(self.mapping_pose_timer)
         self.destroy_publisher(

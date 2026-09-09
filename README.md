@@ -2,7 +2,10 @@
 
 A simulation-based Autonomous Mobile Robot (AMR) project built with ROS 2 Jazzy, Gazebo Harmonic, Navigation2, OpenCV, and RViz2. It combines autonomous navigation, RGB-D perception, ArUco marker pose estimation, and live system health diagnostics in a custom warehouse environment.
 
-> This repository targets simulation on Ubuntu 24.04. Physical robot deployment and visual odometry are not currently implemented.
+> This repository provides a validated simulation stack and the Robot Agent
+> deployment boundary for physical robots. Chassis-level commissioning still
+> requires the hardware acceptance gates below; visual odometry is not
+> implemented.
 
 ## Features
 
@@ -18,6 +21,27 @@ A simulation-based Autonomous Mobile Robot (AMR) project built with ROS 2 Jazzy,
 - ROS 2 simulation time and Gazebo-to-ROS sensor bridges
 - Clean-clone dependency, build, and test validation
 - Headless three-agent Fleet Lab for pairing and multi-robot control-plane tests
+- Versioned Hardware Interface Contract and live ROS graph acceptance check
+
+## Physical robot contract
+
+Every new chassis must satisfy the web platform's
+[Hardware Interface Contract v1.0](https://github.com/nattannsra18/indoor-delivery-robot/blob/main/docs/HARDWARE_INTERFACE_CONTRACT.md).
+It defines the required ROS message types, Nav2 actions/services, TF ownership,
+safety and network boundaries, and the evidence required before production use.
+
+After starting the complete robot bringup, run the executable graph check:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/amr-navigation-vision-diagnostics/install/setup.bash
+./scripts/verify_hardware_contract.sh --physical
+```
+
+Use `--simulation` only for simulator validation. It deliberately skips the
+real battery and physical E-stop gates; a passing simulation report is not a
+physical safety certification. Topic, action, service, and base-frame names
+can be supplied through the environment variables shown by `--help`.
 
 ## Demo Video
 

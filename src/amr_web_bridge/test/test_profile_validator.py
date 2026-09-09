@@ -8,6 +8,7 @@ def healthy_observation():
         'compute_path_action': True,
         'compute_path_action_name': '/compute_path_to_pose',
         'odom_age_seconds': 0.2,
+        'scan_age_seconds': 0.2,
         'amcl_pose_age_seconds': 0.3,
         'map_age_seconds': 12.0,
         'diagnostics_age_seconds': 0.4,
@@ -49,3 +50,33 @@ def test_unknown_capability_is_degraded_instead_of_silently_accepted():
     assert report['status'] == 'DEGRADED'
     assert report['checks'][0]['check_id'] == 'capability.experimental_sensor'
     assert report['checks'][0]['status'] == 'WARN'
+
+
+def test_physical_contract_requires_fresh_battery_and_estop_state():
+    observation = healthy_observation()
+    observation.update({
+        'hardware_contract_mode': 'physical',
+        'battery_age_seconds': 0.4,
+        'physical_estop_age_seconds': 0.2,
+        'physical_estop_latched': False,
+    })
+    report = validate_robot_profile(['navigation'], observation)
+    assert report['status'] == 'READY'
+    assert {
+        item['check_id'] for item in report['checks']
+    } >= {
+        'data.lidar',
+        'data.battery',
+        'data.physical_estop',
+        'capability.physical_estop_clear',
+    }
+
+    observation['physical_estop_latched'] = True
+    report = validate_robot_profile(['navigation'], observation)
+    assert report['status'] == 'NOT_READY'
+    failed = {
+        item['check_id']
+        for item in report['checks']
+        if item['status'] == 'FAIL'
+    }
+    assert 'capability.physical_estop_clear' in failed

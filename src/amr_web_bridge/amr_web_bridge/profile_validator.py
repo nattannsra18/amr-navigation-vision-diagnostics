@@ -109,6 +109,22 @@ def validate_robot_profile(
         'ComputePathToPose action',
     )
     fresh('data.odom', 'navigation', 'odom_age_seconds', 'Odometry topic')
+    if declared & {'navigation', 'localization', 'mapping'}:
+        scan_age = observation.get('scan_age_seconds')
+        scan_fresh = (
+            isinstance(scan_age, (int, float))
+            and 0 <= float(scan_age) <= freshness_seconds
+        )
+        add(
+            'data.lidar',
+            'DATA',
+            scan_fresh,
+            'LiDAR scan is fresh' if scan_fresh else 'LiDAR has no fresh data',
+            observed=(
+                'never received'
+                if scan_age is None else f'{float(scan_age):.2f} s old'
+            ),
+        )
     fresh(
         'data.amcl_pose',
         'localization',
@@ -178,6 +194,45 @@ def validate_robot_profile(
             'diagnostics',
             'diagnostics_age_seconds',
             'Diagnostics topic',
+        )
+
+    if observation.get('hardware_contract_mode') == 'physical':
+        for check_id, age_key, label in (
+            ('data.battery', 'battery_age_seconds', 'Battery state'),
+            (
+                'data.physical_estop',
+                'physical_estop_age_seconds',
+                'Physical Emergency Stop state',
+            ),
+        ):
+            age = observation.get(age_key)
+            passed = (
+                isinstance(age, (int, float))
+                and 0 <= float(age) <= freshness_seconds
+            )
+            add(
+                check_id,
+                'DATA',
+                passed,
+                f'{label} is fresh' if passed else f'{label} has no fresh data',
+                observed=(
+                    'never received'
+                    if age is None else f'{float(age):.2f} s old'
+                ),
+            )
+        physical_estop_latched = bool(
+            observation.get('physical_estop_latched')
+        )
+        add(
+            'capability.physical_estop_clear',
+            'CAPABILITY',
+            not physical_estop_latched,
+            (
+                'Physical Emergency Stop is clear'
+                if not physical_estop_latched
+                else 'Physical Emergency Stop is latched'
+            ),
+            observed='latched' if physical_estop_latched else 'clear',
         )
 
     map_received = observation.get('map_age_seconds') is not None

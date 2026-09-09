@@ -3,11 +3,16 @@ amr_web_bridge:
     robot_serial_number: SIM-0001
     robot_display_name: SCUTTLE-01 Simulator
     profile_version: turtlebot3-waffle-sim-v1
+    hardware_contract_mode: simulation
     agent_capabilities: navigation,mapping,localization,diagnostics
 
     pose_topic: /amcl_pose
     map_topic: /map
     odom_topic: /odom
+    scan_topic: /scan
+    battery_topic: /battery_state
+    physical_estop_topic: /safety/physical_estop
+    physical_estop_stale_seconds: 2.0
     diagnostics_topic: /diagnostics
     path_topic: /plan
     navigate_action: /navigate_to_pose
@@ -17,6 +22,7 @@ amr_web_bridge:
     amcl_state_service: /amcl/get_state
     global_localization_service: /reinitialize_global_localization
     emergency_stop_cmd_vel_topic: /cmd_vel
+    base_frame: base_footprint
 
     heartbeat_period: 5.0
     telemetry_period: 1.0

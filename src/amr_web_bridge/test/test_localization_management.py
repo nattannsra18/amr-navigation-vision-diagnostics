@@ -47,6 +47,7 @@ def bridge(*, pose_age=0.2, moving=False, uncertainty=0.1, mapping=False):
         active_localization_command=None,
         active_command=None,
         emergency_stop_latched=threading.Event(),
+        physical_estop_latched=threading.Event(),
         mapping_teleop_deadman_seconds=0.35,
         localization_velocity_deadline=0.0,
         localization_velocity_active=False,
@@ -54,6 +55,9 @@ def bridge(*, pose_age=0.2, moving=False, uncertainty=0.1, mapping=False):
         publish_zero_velocity=lambda: None,
     )
     value.localization_snapshot = lambda: WebBridgeNode.localization_snapshot(value)
+    value.motion_stop_latched = (
+        lambda: WebBridgeNode.motion_stop_latched(value)
+    )
     value.send_from_ros = value.sent.append
     value.finish_localization_command = (
         lambda command, accepted, detail:
