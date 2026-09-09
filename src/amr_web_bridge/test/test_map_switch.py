@@ -58,6 +58,10 @@ def bridge(tmp_path):
     )
     value.get_logger = lambda: SimpleNamespace(info=lambda _message: None)
     value.send_from_ros = value.sent.append
+    value.agent_readiness_snapshot = lambda: {
+        'type': 'agent_readiness',
+        'active_map_id': value.active_map_id,
+    }
     value.finish_map_switch = lambda *args: WebBridgeNode.finish_map_switch(
         value, *args
     )
@@ -99,6 +103,10 @@ def test_map_switch_uses_validated_robot_file_and_nav2_ack(tmp_path):
     assert value.sent[0]['accepted'] is True
     assert value.sent[1]['type'] == 'map_catalog'
     assert value.sent[1]['active_map_id'] == 'second'
+    assert value.sent[2] == {
+        'type': 'agent_readiness',
+        'active_map_id': 'second',
+    }
 
 
 def test_map_switch_rejects_unavailable_map_before_nav2(tmp_path):

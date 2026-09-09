@@ -3245,6 +3245,7 @@ class WebBridgeNode(Node):
                     self.robot_id,
                 )
             )
+            self.send_from_ros(self.agent_readiness_snapshot())
         self.get_logger().info(
             f"Map switch {command_id}: {'succeeded' if accepted else 'failed'}"
         )
