@@ -38,6 +38,7 @@ from tf2_ros import Buffer, TransformListener
 import websockets
 
 from .agent_identity import (
+    AgentCredential,
     AgentCredentialStore,
     EnrollmentClient,
     EnrollmentError,
@@ -164,9 +165,13 @@ class WebBridgeNode(Node):
         )))
         stored_credential = self.credential_store.load()
         self.robot_credential = os.getenv('ROBOT_AGENT_CREDENTIAL', '')
+        self.robot_credential_version = int(
+            os.getenv('ROBOT_AGENT_CREDENTIAL_VERSION', '0')
+        )
         if stored_credential is not None:
             self.robot_id = stored_credential.robot_id
             self.robot_credential = stored_credential.credential
+            self.robot_credential_version = stored_credential.credential_version
         self.robot_enrollment_token = os.getenv(
             'ROBOT_ENROLLMENT_TOKEN',
             '',
@@ -1306,6 +1311,7 @@ class WebBridgeNode(Node):
                 )
                 self.robot_id = credential.robot_id
                 self.robot_credential = credential.credential
+                self.robot_credential_version = credential.credential_version
                 self.get_logger().info(
                     'Robot paired successfully as '
                     f'{credential.robot_id}; credential stored securely'
@@ -1324,6 +1330,8 @@ class WebBridgeNode(Node):
                 'ros_distro': os.getenv('ROS_DISTRO', 'unknown'),
                 'profile_version': self.profile_version,
                 'capabilities': self.agent_capabilities,
+                'serial_number': self.robot_serial_number,
+                'hardware_fingerprint': self.hardware_fingerprint,
             },
         )
 
@@ -1674,6 +1682,8 @@ class WebBridgeNode(Node):
             )
         elif message_type == 'map_catalog_request':
             await self.send_map_catalog(websocket)
+        elif message_type == 'credential_rotation':
+            await self.handle_credential_rotation(websocket, message)
         elif message_type == 'map_command':
             await self.handle_map_command(websocket, message)
         elif message_type == 'map_catalog_command':
@@ -1737,6 +1747,74 @@ class WebBridgeNode(Node):
             self.get_logger().debug(
                 f'Unhandled WebSocket message: {message_type}'
             )
+
+    async def handle_credential_rotation(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+    ) -> None:
+        credential = message.get('credential')
+        version = message.get('credential_version')
+        valid = (
+            message.get('protocol_version') == '1.0'
+            and message.get('robot_id') == self.robot_id
+            and isinstance(credential, str)
+            and len(credential) >= 32
+            and isinstance(version, int)
+            and version > self.robot_credential_version
+        )
+        if not valid:
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'credential_rotation_failed',
+                    'protocol_version': '1.0',
+                    'robot_id': self.robot_id,
+                    'credential_version': version if isinstance(version, int) else 0,
+                    'detail': 'Invalid credential rotation command',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            return
+        replacement = AgentCredential(
+            robot_id=self.robot_id,
+            credential=credential,
+            credential_version=version,
+            protocol_version='1.0',
+        )
+        try:
+            await asyncio.to_thread(self.credential_store.save, replacement)
+        except OSError as error:
+            self.get_logger().error(
+                f'Credential rotation could not be persisted: {error}'
+            )
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'credential_rotation_failed',
+                    'protocol_version': '1.0',
+                    'robot_id': self.robot_id,
+                    'credential_version': version,
+                    'detail': 'Credential file could not be updated',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            return
+        self.robot_credential = credential
+        self.robot_credential_version = version
+        await self.send_json(
+            websocket,
+            {
+                'type': 'credential_rotated',
+                'protocol_version': '1.0',
+                'robot_id': self.robot_id,
+                'credential_version': version,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        self.get_logger().info(
+            f'Robot credential rotated to version {version}'
+        )
 
     async def handle_mapping_command(
         self,
