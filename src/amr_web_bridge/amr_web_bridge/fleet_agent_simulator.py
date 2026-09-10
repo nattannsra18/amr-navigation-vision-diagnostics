@@ -132,7 +132,7 @@ class FleetAgentSimulator:
             raise EnrollmentError(0, 'ROBOT_ENROLLMENT_TOKEN is required before pairing')
         client = EnrollmentClient(self.server_url, self.bootstrap_token)
         fingerprint = f'fleet-lab:{self.profile.serial_number}:{self.profile.ros_namespace}'
-        enrollment = await asyncio.to_thread(client.create, {
+        enrollment_payload = {
             'serial_number': self.profile.serial_number,
             'hardware_fingerprint': fingerprint,
             'display_name': self.profile.display_name,
@@ -140,7 +140,26 @@ class FleetAgentSimulator:
             'ros_distro': os.getenv('ROS_DISTRO', 'jazzy'),
             'profile_version': self.profile.profile_version,
             'capabilities': self.profile.capabilities,
-        })
+        }
+        while not self.stop_requested.is_set():
+            try:
+                enrollment = await asyncio.to_thread(
+                    client.create,
+                    enrollment_payload,
+                )
+                break
+            except EnrollmentError as error:
+                if error.status != 429:
+                    raise
+                delay = max(1, error.retry_after_seconds or 3)
+                print(
+                    f'[{self.profile.serial_number}] enrollment rate limited; '
+                    f'retrying in {delay} s',
+                    flush=True,
+                )
+                await asyncio.sleep(delay)
+        else:
+            return
         print(
             f'[{self.profile.serial_number}] PAIRING CODE {enrollment.pairing_code} '
             f'(namespace {self.profile.ros_namespace})',
@@ -157,6 +176,18 @@ class FleetAgentSimulator:
             except EnrollmentError as error:
                 if error.status == 409:
                     await asyncio.sleep(enrollment.poll_after_seconds)
+                    continue
+                if error.status == 429:
+                    delay = max(
+                        enrollment.poll_after_seconds,
+                        error.retry_after_seconds or 0,
+                    )
+                    print(
+                        f'[{self.profile.serial_number}] claim rate limited; '
+                        f'keeping the current code and retrying in {delay} s',
+                        flush=True,
+                    )
+                    await asyncio.sleep(delay)
                     continue
                 raise
             await asyncio.to_thread(self.credential_store.save, credential)

@@ -1409,7 +1409,18 @@ class WebBridgeNode(Node):
             'capabilities': self.agent_capabilities,
         }
         while not self.stop_requested.is_set():
-            enrollment = await asyncio.to_thread(client.create, payload)
+            try:
+                enrollment = await asyncio.to_thread(client.create, payload)
+            except EnrollmentError as error:
+                if error.status == 429:
+                    delay = max(1, error.retry_after_seconds or 3)
+                    self.get_logger().warning(
+                        'Robot enrollment is rate limited; retrying the same '
+                        f'identity in {delay} s'
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
             self.get_logger().warning(
                 'Robot pairing required. Code: '
                 f'{enrollment.pairing_code} | Serial: '
@@ -1427,6 +1438,17 @@ class WebBridgeNode(Node):
                 except EnrollmentError as error:
                     if error.status == 409:
                         await asyncio.sleep(enrollment.poll_after_seconds)
+                        continue
+                    if error.status == 429:
+                        delay = max(
+                            enrollment.poll_after_seconds,
+                            error.retry_after_seconds or 0,
+                        )
+                        self.get_logger().warning(
+                            'Pairing claim is rate limited; keeping the current '
+                            f'code and retrying in {delay} s'
+                        )
+                        await asyncio.sleep(delay)
                         continue
                     if error.status == 410:
                         self.get_logger().warning(

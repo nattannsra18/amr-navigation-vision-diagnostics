@@ -2,6 +2,12 @@ import asyncio
 import json
 from pathlib import Path
 
+from amr_web_bridge import fleet_agent_simulator
+from amr_web_bridge.agent_identity import (
+    AgentCredential,
+    EnrollmentError,
+    EnrollmentRequest,
+)
 from amr_web_bridge.fleet_agent_simulator import (
     FleetAgentProfile,
     FleetAgentSimulator,
@@ -103,3 +109,40 @@ def test_launcher_uses_one_credential_file_per_agent():
     assert 'agents=(sim01 sim02 robot-test01)' in launcher
     assert 'credentials/${agent}.json' in launcher
     assert 'reset-credentials' in launcher
+
+
+def test_pairing_rate_limit_keeps_current_enrollment(monkeypatch, tmp_path):
+    calls = {'create': 0, 'claim': 0}
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def create(self, _payload):
+            calls['create'] += 1
+            return EnrollmentRequest('enrollment-1', '12345678', 'later', 3)
+
+        def claim(self, enrollment_id, pairing_code, _fingerprint):
+            assert (enrollment_id, pairing_code) == ('enrollment-1', '12345678')
+            calls['claim'] += 1
+            if calls['claim'] == 1:
+                raise EnrollmentError(429, 'rate limited', retry_after_seconds=8)
+            return AgentCredential('robot-sim01', 'credential', 1)
+
+    async def no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr(fleet_agent_simulator, 'EnrollmentClient', Client)
+    monkeypatch.setattr(fleet_agent_simulator.asyncio, 'sleep', no_wait)
+    agent = FleetAgentSimulator(
+        FleetAgentProfile.load(PROFILE_DIR / 'sim01.yaml'),
+        'https://robot.example',
+        tmp_path / 'sim01.json',
+        'bootstrap-token',
+    )
+
+    asyncio.run(agent._ensure_identity())
+
+    assert calls == {'create': 1, 'claim': 2}
+    assert agent.robot_id == 'robot-sim01'
+    assert agent.credential_store.load().credential == 'credential'

@@ -15,10 +15,16 @@ from urllib.request import Request, urlopen
 class EnrollmentError(RuntimeError):
     """An enrollment request failed with a normalized HTTP status."""
 
-    def __init__(self, status: int, detail: str):
+    def __init__(
+        self,
+        status: int,
+        detail: str,
+        retry_after_seconds: int | None = None,
+    ):
         super().__init__(detail)
         self.status = status
         self.detail = detail
+        self.retry_after_seconds = retry_after_seconds
 
 
 @dataclass(frozen=True)
@@ -161,7 +167,18 @@ class EnrollmentClient:
                 detail = json.loads(error.read().decode('utf-8')).get('detail')
             except (json.JSONDecodeError, AttributeError):
                 detail = None
-            raise EnrollmentError(error.code, str(detail or error.reason)) from error
+            retry_after = None
+            try:
+                header = error.headers.get('Retry-After')
+                if header is not None:
+                    retry_after = max(1, int(float(header)))
+            except (AttributeError, TypeError, ValueError):
+                retry_after = None
+            raise EnrollmentError(
+                error.code,
+                str(detail or error.reason),
+                retry_after_seconds=retry_after,
+            ) from error
         except URLError as error:
             raise EnrollmentError(0, str(error.reason)) from error
         try:
