@@ -97,7 +97,11 @@ class MappingRuntime:
             self._lifecycle('lifecycle_manager_localization', 1)
             localization_paused = True
             launch_arguments = [
-                'ros2', 'launch', 'slam_toolbox', 'online_async_launch.py',
+                # Synchronous scan processing avoids an optimization backlog
+                # while the robot is driven interactively from the web UI.
+                # That backlog can make the live map appear warped even when
+                # the final saved graph is optimized correctly.
+                'ros2', 'launch', 'slam_toolbox', 'online_sync_launch.py',
                 'use_sim_time:=true', 'autostart:=true',
             ]
             if self.slam_params_file:
