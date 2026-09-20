@@ -2,7 +2,10 @@
 
 A simulation-based Autonomous Mobile Robot (AMR) project built with ROS 2 Jazzy, Gazebo Harmonic, Navigation2, OpenCV, and RViz2. It combines autonomous navigation, RGB-D perception, ArUco marker pose estimation, and live system health diagnostics in a custom warehouse environment.
 
-> This repository targets simulation on Ubuntu 24.04. Physical robot deployment and visual odometry are not currently implemented.
+> This repository provides a validated simulation stack and the Robot Agent
+> deployment boundary for physical robots. Chassis-level commissioning still
+> requires the hardware acceptance gates below; visual odometry is not
+> implemented.
 
 ## Features
 
@@ -17,6 +20,28 @@ A simulation-based Autonomous Mobile Robot (AMR) project built with ROS 2 Jazzy,
 - Interactive automated runtime verification
 - ROS 2 simulation time and Gazebo-to-ROS sensor bridges
 - Clean-clone dependency, build, and test validation
+- Headless three-agent Fleet Lab for pairing and multi-robot control-plane tests
+- Versioned Hardware Interface Contract and live ROS graph acceptance check
+
+## Physical robot contract
+
+Every new chassis must satisfy the web platform's
+[Hardware Interface Contract v1.0](https://github.com/nattannsra18/indoor-delivery-robot/blob/main/docs/HARDWARE_INTERFACE_CONTRACT.md).
+It defines the required ROS message types, Nav2 actions/services, TF ownership,
+safety and network boundaries, and the evidence required before production use.
+
+After starting the complete robot bringup, run the executable graph check:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/amr-navigation-vision-diagnostics/install/setup.bash
+./scripts/verify_hardware_contract.sh --physical
+```
+
+Use `--simulation` only for simulator validation. It deliberately skips the
+real battery and physical E-stop gates; a passing simulation report is not a
+physical safety certification. Topic, action, service, and base-frame names
+can be supplied through the environment variables shown by `--help`.
 
 ## Demo Video
 
@@ -217,6 +242,101 @@ A successful build should report:
 Summary: 5 packages finished
 ```
 
+## Multi-Robot Fleet Lab
+
+The Fleet Lab runs three independent headless Robot Agents on one computer. It
+uses the real enrollment and Agent Protocol WebSocket endpoints, while simulated
+navigation results remove the need to run three Gazebo/Nav2 stacks.
+
+| Agent | Serial | ROS namespace | Active map | Capabilities |
+|---|---|---|---|---|
+| `sim01` | `FLEET-SIM-0001` | `/sim01` | `warehouse_map` | navigation, mapping, localization, diagnostics |
+| `sim02` | `FLEET-SIM-0002` | `/sim02` | `warehouse_map` | navigation, localization, diagnostics |
+| `robot-test01` | `FLEET-TEST-0001` | `/robot_test01` | `lab_map` | localization, diagnostics |
+
+Start the FastAPI/web stack first, then run:
+
+```bash
+cd ~/amr-navigation-vision-diagnostics
+./scripts/fleet_lab.sh start
+./scripts/fleet_lab.sh status
+```
+
+Open `http://localhost:3000/robots` and approve the three pairing requests.
+Each agent stores its issued credential in a separate file under
+`~/.local/state/indoor-delivery-fleet-lab/credentials/`.
+
+Useful failure and recovery scenarios:
+
+```bash
+# Simulate one robot going offline during a mission.
+./scripts/fleet_lab.sh stop sim01
+./scripts/fleet_lab.sh start sim01
+
+# Follow one agent log, including pairing and reconnect events.
+./scripts/fleet_lab.sh logs sim02
+
+# After revoking sim02 in Robot Registry, remove only its local credential
+# before requesting a fresh pairing.
+./scripts/fleet_lab.sh reset-credentials sim02
+./scripts/fleet_lab.sh start sim02
+
+# Stop the whole lab.
+./scripts/fleet_lab.sh stop
+```
+
+Use `sim01` and `sim02` to verify explicit and automatic task dispatch on
+`warehouse_map`. `robot-test01` intentionally has another map and no navigation
+capability, so the delivery UI must not offer it as an eligible delivery robot.
+
+## Robot Agent Installer
+
+Prepare a robot-specific profile from
+`src/amr_web_bridge/config/profiles/scuttle_real.example.yaml`. Replace the
+serial number, verify every ROS interface name, and keep motor, encoder and
+sensor-driver settings in their owning ROS packages.
+
+Run a non-mutating preflight first. The enrollment token file should contain
+only the limited bootstrap token and should be readable only by its owner.
+
+```bash
+chmod 600 ~/robot-enrollment-token
+
+./scripts/install_robot_agent.sh \
+  --profile ~/robot-agent.yaml \
+  --control-url wss://control.example.com \
+  --registry-url https://control.example.com/robots \
+  --enrollment-token-file ~/robot-enrollment-token \
+  --dry-run
+```
+
+Install and start the Agent after the preflight succeeds:
+
+```bash
+sudo ./scripts/install_robot_agent.sh \
+  --profile ~/robot-agent.yaml \
+  --control-url wss://control.example.com \
+  --registry-url https://control.example.com/robots \
+  --enrollment-token-file ~/robot-enrollment-token
+```
+
+The installer builds a relocatable Agent workspace under `/opt`, creates the
+unprivileged `indoor-robot` system account, installs protected configuration and
+credential directories, enables the hardened systemd service, and prints the
+Robot Registry URL and pairing information. It does not install ROS itself or
+change hardware-driver configuration.
+
+After the administrator approves pairing and the credential file appears,
+remove `ROBOT_ENROLLMENT_TOKEN` from `/etc/indoor-delivery-robot/agent.env` and
+restart the service. The per-robot credential remains in
+`/var/lib/indoor-delivery-robot/agent-credential.json`.
+
+```bash
+sudo systemctl restart indoor-delivery-robot-agent.service
+sudo systemctl status indoor-delivery-robot-agent.service
+sudo journalctl -u indoor-delivery-robot-agent.service -f
+```
+
 Source both setup files in every new terminal:
 
 ```bash
@@ -243,25 +363,94 @@ source install/setup.bash
 
 ## Run
 
-### Authenticated web bridge and software Emergency Stop
+### Secure Robot Agent pairing and software Emergency Stop
 
-Set the same random robot credential configured in FastAPI without placing it
-on a command line or URL:
+For a new robot, configure only the limited bootstrap enrollment credential.
+The agent connects outward to FastAPI, prints a short pairing code and the
+verification fingerprint, then waits for an administrator to approve it in
+**Robot Registry**. After approval, the agent claims an individual credential
+and stores it with owner-only file permissions:
 
 ```bash
-export ROBOT_WS_TOKEN='<same-random-token-as-backend>'
+export ROBOT_ENROLLMENT_TOKEN='<same-bootstrap-token-as-backend>'
 ros2 run amr_web_bridge web_bridge_node --ros-args \
   -p server_url:=ws://localhost:8000 \
-  -p robot_id:=robot01 \
+  -p robot_serial_number:=SCUTTLE-0001 \
+  -p robot_display_name:='SCUTTLE-01' \
+  -p profile_version:=scuttle-v1 \
   -p emergency_stop_cmd_vel_topic:=/cmd_vel \
   -p emergency_stop_zero_rate:=10.0
 ```
 
-The bridge sends the credential as an Authorization bearer header and does not
-log it. `/cmd_vel` is the final simulation command topic (the velocity smoother
-outputs there and the Gazebo drive plugin consumes it). While latched, the
-bridge cancels Nav2 asynchronously, drops queued navigation, rejects new goals,
-and publishes zero `Twist` at 10 Hz. Reset never replays the interrupted goal.
+The default credential path is
+`~/.config/indoor-delivery-robot/<serial>.json`; override it with
+`ROBOT_CREDENTIAL_FILE`. The agent never logs the credential. On later boots it
+reconnects automatically, sends an Agent Protocol v1 handshake, and reports
+Nav2/map/localization readiness independently from socket connectivity.
+
+Readiness is generated by the Robot Profile Validator. It checks the actions,
+services, fresh topic data, `map -> odom -> base` TF chain, lifecycle state, and
+storage required by the capabilities declared in the selected profile. The
+structured result is sent to the control plane so Robot Registry can explain
+each `NOT_READY` or `DEGRADED` state instead of showing only a summary label.
+
+Navigation commands are accepted only when the robot identity, optional map and
+profile expectations, and command expiry are valid. A bounded command-ID cache
+prevents a repeated WebSocket frame from repeating physical motion, and the
+Agent reports accepted/rejected, started, and succeeded/failed lifecycle states.
+
+Robot-specific ROS interfaces are selected with a parameter profile rather than
+source changes. The package includes
+`config/profiles/turtlebot3_waffle_sim.yaml` and a non-secret
+`config/profiles/scuttle_real.example.yaml` template. A physical deployment can
+start with:
+
+```bash
+ros2 run amr_web_bridge web_bridge_node --ros-args \
+  --params-file /etc/indoor-delivery-robot/robot-agent.yaml \
+  -p server_url:=wss://control.example.com
+```
+
+Use ROS remaps or edit the deployed profile if interface names differ. Motor,
+encoder, wheel, sensor-driver, and PID parameters remain in the corresponding
+hardware ROS packages and are intentionally not exposed through the web Agent.
+
+### Start the Agent automatically on a robot
+
+The package includes a hardened systemd template under `deploy/systemd` and a
+non-secret environment example under `deploy`. On the robot SBC:
+
+1. Create a dedicated `indoor-robot` system user.
+2. Install the workspace at the path configured by `ROBOT_WORKSPACE`.
+3. Copy a completed robot profile to
+   `/etc/indoor-delivery-robot/robot-agent.yaml`.
+4. Copy `robot-agent.env.example` to
+   `/etc/indoor-delivery-robot/agent.env`, replace its placeholders, and set
+   owner-only permissions (`chmod 600`).
+5. Install the service as
+   `/etc/systemd/system/indoor-delivery-robot-agent.service`, then enable it.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now indoor-delivery-robot-agent.service
+sudo journalctl -u indoor-delivery-robot-agent.service -f
+```
+
+The first journal session shows the pairing code. After an administrator
+approves it, the credential is written under `/var/lib/indoor-delivery-robot`
+and subsequent boots reconnect without operator input. The service deliberately
+does not grant access to hardware configuration or replace the physical safety
+controller.
+
+`ROBOT_WS_TOKEN` remains supported only for migration of an existing simulator.
+Do not share that token across physical robots, and disable legacy-token support
+in FastAPI after all agents are paired.
+
+`/cmd_vel` is the final simulation command topic (the velocity smoother outputs
+there and the Gazebo drive plugin consumes it). While software Emergency Stop is
+latched, the agent cancels Nav2 asynchronously, drops queued navigation, rejects
+new goals, and publishes zero `Twist` at 10 Hz. Reset never replays the
+interrupted goal.
 
 Delivery previews use Nav2's `/compute_path_to_pose` action twice (robot to
 pickup and pickup to destination). The bridge returns the bounded planner paths

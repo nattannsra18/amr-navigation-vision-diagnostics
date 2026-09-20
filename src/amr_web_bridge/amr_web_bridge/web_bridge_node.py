@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from datetime import datetime, timezone
 import json
 import math
 import os
+from pathlib import Path as FilePath
 from queue import Empty, Queue
 import threading
 import time
 from typing import Any
+from uuid import uuid4
 
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
@@ -30,9 +33,20 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 from rclpy.time import Time
+from sensor_msgs.msg import BatteryState, LaserScan
+from std_msgs.msg import Bool
 from std_srvs.srv import Empty as EmptyService
 from tf2_ros import Buffer, TransformListener
 import websockets
+
+from .agent_identity import (
+    AgentCredential,
+    AgentCredentialStore,
+    EnrollmentClient,
+    EnrollmentError,
+    machine_fingerprint,
+    verification_fingerprint,
+)
 
 from .map_catalog import (
     available_map_yaml,
@@ -48,6 +62,7 @@ from .path_utils import (
     serialize_path,
     serialize_preview_path,
 )
+from .profile_validator import validate_robot_profile
 
 
 class WebBridgeNode(Node):
@@ -57,6 +72,14 @@ class WebBridgeNode(Node):
 
         self.declare_parameter('server_url', 'ws://localhost:8000')
         self.declare_parameter('robot_id', 'robot01')
+        self.declare_parameter('robot_serial_number', 'SIM-0001')
+        self.declare_parameter('robot_display_name', 'SCUTTLE-01 Simulator')
+        self.declare_parameter('agent_version', '0.2.0')
+        self.declare_parameter('profile_version', 'turtlebot3-waffle-sim-v1')
+        self.declare_parameter(
+            'agent_capabilities',
+            'navigation,mapping,localization,diagnostics',
+        )
         self.declare_parameter('heartbeat_period', 5.0)
         self.declare_parameter('telemetry_period', 1.0)
         self.declare_parameter('reconnect_delay', 3.0)
@@ -73,9 +96,19 @@ class WebBridgeNode(Node):
         self.declare_parameter('map_catalog_period', 10.0)
         self.declare_parameter('load_map_service', '/map_server/load_map')
         self.declare_parameter('odom_topic', '/odom')
+        self.declare_parameter('scan_topic', '/scan')
+        self.declare_parameter('battery_topic', '/battery_state')
+        self.declare_parameter(
+            'physical_estop_topic',
+            '/safety/physical_estop',
+        )
+        self.declare_parameter('physical_estop_stale_seconds', 2.0)
+        self.declare_parameter('hardware_contract_mode', 'simulation')
         self.declare_parameter('diagnostics_topic', '/diagnostics')
         self.declare_parameter('diagnostics_stale_after_seconds', 3.0)
         self.declare_parameter('diagnostics_expire_after_seconds', 60.0)
+        self.declare_parameter('profile_data_freshness_seconds', 3.0)
+        self.declare_parameter('base_frame', 'base_footprint')
         self.declare_parameter('path_topic', '/plan')
         self.declare_parameter('path_max_poses', 500)
         self.declare_parameter('path_publish_period', 0.5)
@@ -106,6 +139,52 @@ class WebBridgeNode(Node):
         ).rstrip('/')
         self.robot_id = str(
             self.get_parameter('robot_id').value
+        )
+        self.robot_serial_number = str(
+            self.get_parameter('robot_serial_number').value
+        ).strip()
+        self.robot_display_name = str(
+            self.get_parameter('robot_display_name').value
+        ).strip()
+        self.agent_version = str(
+            self.get_parameter('agent_version').value
+        ).strip()
+        self.profile_version = str(
+            self.get_parameter('profile_version').value
+        ).strip()
+        self.agent_capabilities = sorted({
+            item.strip().lower()
+            for item in str(
+                self.get_parameter('agent_capabilities').value
+            ).split(',')
+            if item.strip()
+        })
+        self.agent_boot_id = str(uuid4())
+        self.hardware_fingerprint = machine_fingerprint(
+            self.robot_serial_number
+        )
+        default_credential_file = (
+            FilePath.home()
+            / '.config'
+            / 'indoor-delivery-robot'
+            / f'{self.robot_serial_number}.json'
+        )
+        self.credential_store = AgentCredentialStore(FilePath(os.getenv(
+            'ROBOT_CREDENTIAL_FILE',
+            str(default_credential_file),
+        )))
+        stored_credential = self.credential_store.load()
+        self.robot_credential = os.getenv('ROBOT_AGENT_CREDENTIAL', '')
+        self.robot_credential_version = int(
+            os.getenv('ROBOT_AGENT_CREDENTIAL_VERSION', '0')
+        )
+        if stored_credential is not None:
+            self.robot_id = stored_credential.robot_id
+            self.robot_credential = stored_credential.credential
+            self.robot_credential_version = stored_credential.credential_version
+        self.robot_enrollment_token = os.getenv(
+            'ROBOT_ENROLLMENT_TOKEN',
+            '',
         )
         self.heartbeat_period = float(
             self.get_parameter('heartbeat_period').value
@@ -138,6 +217,28 @@ class WebBridgeNode(Node):
         self.odom_topic = str(
             self.get_parameter('odom_topic').value
         )
+        self.scan_topic = str(
+            self.get_parameter('scan_topic').value
+        )
+        self.battery_topic = str(
+            self.get_parameter('battery_topic').value
+        )
+        self.physical_estop_topic = str(
+            self.get_parameter('physical_estop_topic').value
+        )
+        self.physical_estop_stale_seconds = max(
+            0.1,
+            float(
+                self.get_parameter('physical_estop_stale_seconds').value
+            ),
+        )
+        self.hardware_contract_mode = str(
+            self.get_parameter('hardware_contract_mode').value
+        ).strip().lower()
+        if self.hardware_contract_mode not in {'physical', 'simulation'}:
+            raise ValueError(
+                'hardware_contract_mode must be physical or simulation'
+            )
         self.diagnostics_topic = str(
             self.get_parameter('diagnostics_topic').value
         )
@@ -173,8 +274,14 @@ class WebBridgeNode(Node):
                 self.get_parameter('path_publish_period').value
             ),
         )
-        self.battery_percent = int(
-            self.get_parameter('battery_percent').value
+        self.battery_percent = min(
+            100,
+            max(0, int(self.get_parameter('battery_percent').value)),
+        )
+        self.battery_source = (
+            'UNAVAILABLE'
+            if self.hardware_contract_mode == 'physical'
+            else 'SIMULATED'
         )
         self.navigate_action = str(
             self.get_parameter('navigate_action').value
@@ -241,6 +348,7 @@ class WebBridgeNode(Node):
         self.mapping_velocity_lock = threading.Lock()
         self.localization_lock = threading.Lock()
         self.emergency_stop_latched = threading.Event()
+        self.physical_estop_latched = threading.Event()
         self.last_emergency_command_id: str | None = None
         self.latest_telemetry: dict[str, Any] | None = None
         self.latest_map: dict[str, Any] | None = None
@@ -248,6 +356,12 @@ class WebBridgeNode(Node):
         self.latest_velocity: (
             dict[str, float] | None
         ) = None
+        self.last_map_monotonic: float | None = None
+        self.last_odom_monotonic: float | None = None
+        self.last_scan_monotonic: float | None = None
+        self.last_battery_monotonic: float | None = None
+        self.last_physical_estop_monotonic: float | None = None
+        self.last_diagnostics_monotonic: float | None = None
         self.map_revision = 0
         self.diagnostics_revision = 0
         self.node_started_monotonic = time.monotonic()
@@ -268,6 +382,8 @@ class WebBridgeNode(Node):
             dict[str, Any]
         ] = Queue()
         self.pending_command_ids: set[str] = set()
+        self.processed_command_ids: OrderedDict[str, None] = OrderedDict()
+        self.processed_command_limit = 512
         self.pending_cancel_requests: dict[
             str,
             dict[str, Any],
@@ -298,6 +414,11 @@ class WebBridgeNode(Node):
         )
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.profile_data_freshness_seconds = max(
+            0.5,
+            float(self.get_parameter('profile_data_freshness_seconds').value),
+        )
+        self.base_frame = str(self.get_parameter('base_frame').value).strip() or 'base_footprint'
         self.mapping_velocity_deadline = 0.0
         self.mapping_velocity_active = False
         self.localization_velocity_deadline = 0.0
@@ -342,6 +463,30 @@ class WebBridgeNode(Node):
             self.odom_topic,
             self.odom_callback,
             self.odom_qos,
+        )
+        self.scan_subscription = self.create_subscription(
+            LaserScan,
+            self.scan_topic,
+            self.scan_callback,
+            self.odom_qos,
+        )
+        self.safety_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.battery_subscription = self.create_subscription(
+            BatteryState,
+            self.battery_topic,
+            self.battery_callback,
+            self.safety_qos,
+        )
+        self.physical_estop_subscription = self.create_subscription(
+            Bool,
+            self.physical_estop_topic,
+            self.physical_estop_callback,
+            self.safety_qos,
         )
         self.diagnostics_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -422,6 +567,10 @@ class WebBridgeNode(Node):
         self.emergency_zero_timer = self.create_timer(
             1.0 / self.emergency_stop_zero_rate,
             self.publish_emergency_zero,
+        )
+        self.physical_estop_watchdog_timer = self.create_timer(
+            0.2,
+            self.enforce_physical_estop_watchdog,
         )
         self.mapping_deadman_timer = self.create_timer(
             0.05,
@@ -506,14 +655,13 @@ class WebBridgeNode(Node):
         )
         yaw = math.atan2(sin_yaw, cos_yaw)
 
+        battery, battery_source = self.current_battery_state()
         telemetry = {
             'x': float(pose.position.x),
             'y': float(pose.position.y),
             'yaw': float(yaw),
-            'battery': self.battery_percent,
-            # Gazebo currently has no BatteryState source. Keep the configured
-            # charge visible for simulation while explicitly identifying it.
-            'battery_source': 'SIMULATED',
+            'battery': battery,
+            'battery_source': battery_source,
             'frame_id': message.header.frame_id or 'map',
             'timestamp': self.utc_timestamp(),
         }
@@ -564,6 +712,66 @@ class WebBridgeNode(Node):
                 'linear_velocity': linear_velocity,
                 'angular_velocity': angular_velocity,
             }
+            self.last_odom_monotonic = time.monotonic()
+
+    def scan_callback(self, _message: LaserScan) -> None:
+        self.last_scan_monotonic = time.monotonic()
+
+    def battery_callback(self, message: BatteryState) -> None:
+        percentage = float(message.percentage)
+        if not math.isfinite(percentage) or not 0.0 <= percentage <= 1.0:
+            return
+        with self.telemetry_lock:
+            self.battery_percent = round(percentage * 100.0)
+            self.battery_source = 'SENSOR'
+            self.last_battery_monotonic = time.monotonic()
+
+    def current_battery_state(self) -> tuple[int, str]:
+        with self.telemetry_lock:
+            return self.battery_percent, self.battery_source
+
+    def physical_estop_callback(self, message: Bool) -> None:
+        self.last_physical_estop_monotonic = time.monotonic()
+        if bool(message.data):
+            self.latch_physical_estop()
+            return
+        self.physical_estop_latched.clear()
+        self.publish_zero_velocity()
+
+    def latch_physical_estop(self) -> None:
+        was_latched = self.physical_estop_latched.is_set()
+        self.physical_estop_latched.set()
+        self.publish_emergency_zero()
+        if was_latched:
+            return
+        self.clear_command_queue()
+        self.clear_navigation_path(send_clear=True, force=True)
+        with self.command_lock:
+            goal_handle = self.active_goal_handle
+            self.active_command = None
+            self.active_goal_handle = None
+            self.pending_command_ids.clear()
+            self.pending_cancel_requests.clear()
+        if goal_handle is not None:
+            try:
+                goal_handle.cancel_goal_async()
+            except Exception as error:
+                self.get_logger().error(
+                    'Physical Emergency Stop Nav2 cancellation failed: '
+                    f'{error}'
+                )
+
+    def enforce_physical_estop_watchdog(self) -> None:
+        if self.hardware_contract_mode != 'physical':
+            return
+        last_update = self.last_physical_estop_monotonic
+        if (
+            last_update is not None
+            and time.monotonic() - last_update
+            <= self.physical_estop_stale_seconds
+        ):
+            return
+        self.latch_physical_estop()
 
     def update_mapping_pose(self) -> None:
         snapshot = self.mapping_runtime.snapshot(self.map_revision)
@@ -573,7 +781,7 @@ class WebBridgeNode(Node):
         try:
             transform = self.tf_buffer.lookup_transform(
                 'map',
-                'base_footprint',
+                self.base_frame,
                 Time(),
             )
         except Exception:
@@ -589,12 +797,13 @@ class WebBridgeNode(Node):
             orientation.y * orientation.y
             + orientation.z * orientation.z
         )
+        battery, battery_source = self.current_battery_state()
         telemetry = {
             'x': float(translation.x),
             'y': float(translation.y),
             'yaw': float(math.atan2(sin_yaw, cos_yaw)),
-            'battery': self.battery_percent,
-            'battery_source': 'SIMULATED',
+            'battery': battery,
+            'battery_source': battery_source,
             'frame_id': 'map',
             'timestamp': self.utc_timestamp(),
         }
@@ -629,8 +838,8 @@ class WebBridgeNode(Node):
     def capture_mapping_pose_reference(self) -> None:
         try:
             self.mapping_pose_reference = (
-                self.lookup_planar_pose('map', 'base_footprint'),
-                self.lookup_planar_pose('odom', 'base_footprint'),
+                self.lookup_planar_pose('map', self.base_frame),
+                self.lookup_planar_pose('odom', self.base_frame),
             )
         except Exception:
             self.mapping_pose_reference = None
@@ -954,6 +1163,7 @@ class WebBridgeNode(Node):
             )
             self.latest_diagnostics = diagnostics
             self.diagnostics_revision += 1
+            self.last_diagnostics_monotonic = received_at
 
     def diagnostics_snapshot(
         self,
@@ -1028,6 +1238,7 @@ class WebBridgeNode(Node):
         with self.map_lock:
             self.latest_map = map_payload
             self.map_revision += 1
+            self.last_map_monotonic = time.monotonic()
 
         self.get_logger().info(
             'Received ROS map '
@@ -1094,6 +1305,10 @@ class WebBridgeNode(Node):
 
         while not self.stop_requested.is_set():
             try:
+                await self.ensure_robot_identity()
+                self.websocket_uri = (
+                    f'{self.server_url}/ws/robots/{self.robot_id}'
+                )
                 self.get_logger().info('Connecting to FastAPI...')
 
                 async with websockets.connect(
@@ -1101,10 +1316,11 @@ class WebBridgeNode(Node):
                     extra_headers=(
                         {
                             'Authorization': (
-                                f'Bearer {self.robot_ws_token}'
+                                'Bearer '
+                                f'{self.robot_credential or self.robot_ws_token}'
                             )
                         }
-                        if self.robot_ws_token
+                        if self.robot_credential or self.robot_ws_token
                         else None
                     ),
                     open_timeout=5,
@@ -1113,6 +1329,8 @@ class WebBridgeNode(Node):
                 ) as websocket:
                     self.websocket = websocket
                     self.send_lock = asyncio.Lock()
+                    if self.robot_credential:
+                        await self.send_agent_hello(websocket)
                     self.get_logger().info(
                         'Connected to FastAPI WebSocket'
                     )
@@ -1142,6 +1360,9 @@ class WebBridgeNode(Node):
                         asyncio.create_task(
                             self.localization_status_loop(websocket)
                         ),
+                        asyncio.create_task(
+                            self.agent_readiness_loop(websocket)
+                        ),
                     ]
 
                     try:
@@ -1170,6 +1391,214 @@ class WebBridgeNode(Node):
                     f'Reconnecting in {self.reconnect_delay:.1f} s'
                 )
                 await asyncio.sleep(self.reconnect_delay)
+
+    async def ensure_robot_identity(self) -> None:
+        if self.robot_credential or not self.robot_enrollment_token:
+            return
+        client = EnrollmentClient(
+            self.server_url,
+            self.robot_enrollment_token,
+        )
+        payload = {
+            'serial_number': self.robot_serial_number,
+            'hardware_fingerprint': self.hardware_fingerprint,
+            'display_name': self.robot_display_name,
+            'agent_version': self.agent_version,
+            'ros_distro': os.getenv('ROS_DISTRO', 'unknown'),
+            'profile_version': self.profile_version,
+            'capabilities': self.agent_capabilities,
+        }
+        while not self.stop_requested.is_set():
+            try:
+                enrollment = await asyncio.to_thread(client.create, payload)
+            except EnrollmentError as error:
+                if error.status == 429:
+                    delay = max(1, error.retry_after_seconds or 3)
+                    self.get_logger().warning(
+                        'Robot enrollment is rate limited; retrying the same '
+                        f'identity in {delay} s'
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+            self.get_logger().warning(
+                'Robot pairing required. Code: '
+                f'{enrollment.pairing_code} | Serial: '
+                f'{self.robot_serial_number} | Fingerprint: '
+                f'{verification_fingerprint(self.hardware_fingerprint)}'
+            )
+            while not self.stop_requested.is_set():
+                try:
+                    credential = await asyncio.to_thread(
+                        client.claim,
+                        enrollment.enrollment_id,
+                        enrollment.pairing_code,
+                        self.hardware_fingerprint,
+                    )
+                except EnrollmentError as error:
+                    if error.status == 409:
+                        await asyncio.sleep(enrollment.poll_after_seconds)
+                        continue
+                    if error.status == 429:
+                        delay = max(
+                            enrollment.poll_after_seconds,
+                            error.retry_after_seconds or 0,
+                        )
+                        self.get_logger().warning(
+                            'Pairing claim is rate limited; keeping the current '
+                            f'code and retrying in {delay} s'
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    if error.status == 410:
+                        self.get_logger().warning(
+                            'Pairing code expired; requesting a new code'
+                        )
+                        break
+                    raise
+                await asyncio.to_thread(
+                    self.credential_store.save,
+                    credential,
+                )
+                self.robot_id = credential.robot_id
+                self.robot_credential = credential.credential
+                self.robot_credential_version = credential.credential_version
+                self.get_logger().info(
+                    'Robot paired successfully as '
+                    f'{credential.robot_id}; credential stored securely'
+                )
+                return
+
+    async def send_agent_hello(self, websocket: Any) -> None:
+        await self.send_json(
+            websocket,
+            {
+                'type': 'agent_hello',
+                'protocol_version': '1.0',
+                'robot_id': self.robot_id,
+                'boot_id': self.agent_boot_id,
+                'agent_version': self.agent_version,
+                'ros_distro': os.getenv('ROS_DISTRO', 'unknown'),
+                'profile_version': self.profile_version,
+                'capabilities': self.agent_capabilities,
+                'serial_number': self.robot_serial_number,
+                'hardware_fingerprint': self.hardware_fingerprint,
+            },
+        )
+
+    def agent_readiness_snapshot(self) -> dict[str, Any]:
+        now = time.monotonic()
+        mapping_active = self.mapping_runtime.snapshot(
+            self.map_revision
+        ).get('phase') not in {'IDLE', 'REVIEW', 'FAILED'}
+        with self.map_lock:
+            map_age = (
+                now - self.last_map_monotonic
+                if self.last_map_monotonic is not None else None
+            )
+        with self.velocity_lock:
+            odom_age = (
+                now - self.last_odom_monotonic
+                if self.last_odom_monotonic is not None else None
+            )
+            velocity = dict(self.latest_velocity) if self.latest_velocity else None
+        robot_moving = bool(
+            velocity
+            and (
+                abs(float(velocity.get('linear_velocity', 0.0))) > 0.02
+                or abs(float(velocity.get('angular_velocity', 0.0))) > 0.02
+            )
+        )
+        scan_age = (
+            now - self.last_scan_monotonic
+            if self.last_scan_monotonic is not None else None
+        )
+        with self.telemetry_lock:
+            battery_age = (
+                now - self.last_battery_monotonic
+                if self.last_battery_monotonic is not None else None
+            )
+        physical_estop_age = (
+            now - self.last_physical_estop_monotonic
+            if self.last_physical_estop_monotonic is not None else None
+        )
+        with self.localization_lock:
+            pose_age = (
+                now - self.last_localization_monotonic
+                if self.last_localization_monotonic is not None else None
+            )
+            amcl_state = self.amcl_state
+        with self.diagnostics_lock:
+            diagnostics_age = (
+                now - self.last_diagnostics_monotonic
+                if self.last_diagnostics_monotonic is not None else None
+            )
+
+        def transform_available(target: str, source: str) -> bool:
+            try:
+                return self.tf_buffer.can_transform(target, source, Time())
+            except Exception:
+                return False
+
+        report = validate_robot_profile(
+            self.agent_capabilities,
+            {
+                'navigate_action': self.navigation_client.server_is_ready(),
+                'navigate_action_name': self.navigate_action,
+                'compute_path_action': self.preview_client.server_is_ready(),
+                'compute_path_action_name': self.compute_path_action,
+                'odom_age_seconds': odom_age,
+                'scan_age_seconds': scan_age,
+                'amcl_pose_age_seconds': pose_age,
+                'robot_moving': robot_moving,
+                'map_age_seconds': map_age,
+                'diagnostics_age_seconds': diagnostics_age,
+                'tf_map_to_odom': transform_available('map', 'odom'),
+                'tf_odom_to_base': transform_available(
+                    'odom', self.base_frame
+                ),
+                'amcl_state': 'INACTIVE' if mapping_active else amcl_state,
+                'global_localization_service': (
+                    self.global_localization_client.service_is_ready()
+                ),
+                'global_localization_service_name': (
+                    self.global_localization_service
+                ),
+                'maps_directory': self.maps_directory,
+                'load_map_service': self.load_map_client.service_is_ready(),
+                'load_map_service_name': self.load_map_service,
+                'hardware_contract_mode': self.hardware_contract_mode,
+                'battery_age_seconds': battery_age,
+                'physical_estop_age_seconds': physical_estop_age,
+                'physical_estop_latched': (
+                    self.physical_estop_latched.is_set()
+                ),
+            },
+            freshness_seconds=self.profile_data_freshness_seconds,
+        )
+        checks = {
+            item['check_id']: item['status'] == 'PASS'
+            for item in report['checks']
+        }
+        return {
+            'type': 'agent_readiness',
+            'protocol_version': '1.0',
+            'robot_id': self.robot_id,
+            'status': report['status'],
+            'checks': checks,
+            'validation_results': report['checks'],
+            'active_map_id': self.active_map_id,
+            'detail': report['detail'],
+            'timestamp': self.utc_timestamp(),
+        }
+
+    async def agent_readiness_loop(self, websocket: Any) -> None:
+        while not self.stop_requested.is_set():
+            await self.send_json(
+                websocket,
+                self.agent_readiness_snapshot(),
+            )
+            await asyncio.sleep(2.0)
 
     async def heartbeat_loop(self, websocket: Any) -> None:
         while not self.stop_requested.is_set():
@@ -1433,6 +1862,8 @@ class WebBridgeNode(Node):
             )
         elif message_type == 'map_catalog_request':
             await self.send_map_catalog(websocket)
+        elif message_type == 'credential_rotation':
+            await self.handle_credential_rotation(websocket, message)
         elif message_type == 'map_command':
             await self.handle_map_command(websocket, message)
         elif message_type == 'map_catalog_command':
@@ -1468,6 +1899,11 @@ class WebBridgeNode(Node):
             self.get_logger().info(
                 'FastAPI received command acknowledgement'
             )
+        elif message_type == 'command_status_received':
+            self.get_logger().debug(
+                'FastAPI received command lifecycle status '
+                f"{message.get('lifecycle')}"
+            )
         elif message_type == 'navigation_result_received':
             self.get_logger().info(
                 'FastAPI applied navigation result: '
@@ -1491,6 +1927,74 @@ class WebBridgeNode(Node):
             self.get_logger().debug(
                 f'Unhandled WebSocket message: {message_type}'
             )
+
+    async def handle_credential_rotation(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+    ) -> None:
+        credential = message.get('credential')
+        version = message.get('credential_version')
+        valid = (
+            message.get('protocol_version') == '1.0'
+            and message.get('robot_id') == self.robot_id
+            and isinstance(credential, str)
+            and len(credential) >= 32
+            and isinstance(version, int)
+            and version > self.robot_credential_version
+        )
+        if not valid:
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'credential_rotation_failed',
+                    'protocol_version': '1.0',
+                    'robot_id': self.robot_id,
+                    'credential_version': version if isinstance(version, int) else 0,
+                    'detail': 'Invalid credential rotation command',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            return
+        replacement = AgentCredential(
+            robot_id=self.robot_id,
+            credential=credential,
+            credential_version=version,
+            protocol_version='1.0',
+        )
+        try:
+            await asyncio.to_thread(self.credential_store.save, replacement)
+        except OSError as error:
+            self.get_logger().error(
+                f'Credential rotation could not be persisted: {error}'
+            )
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'credential_rotation_failed',
+                    'protocol_version': '1.0',
+                    'robot_id': self.robot_id,
+                    'credential_version': version,
+                    'detail': 'Credential file could not be updated',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            return
+        self.robot_credential = credential
+        self.robot_credential_version = version
+        await self.send_json(
+            websocket,
+            {
+                'type': 'credential_rotated',
+                'protocol_version': '1.0',
+                'robot_id': self.robot_id,
+                'credential_version': version,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        self.get_logger().info(
+            f'Robot credential rotated to version {version}'
+        )
 
     async def handle_mapping_command(
         self,
@@ -1530,7 +2034,7 @@ class WebBridgeNode(Node):
                         self.active_map_command is not None
                         or not self.map_command_queue.empty()
                     )
-                if self.emergency_stop_latched.is_set():
+                if self.motion_stop_latched():
                     raise ValueError('Emergency Stop is latched')
                 if (
                     navigation_active
@@ -1579,7 +2083,7 @@ class WebBridgeNode(Node):
             message.get('robot_id') == self.robot_id
             and message.get('session_id') == snapshot.get('session_id')
             and snapshot.get('phase') == 'MAPPING'
-            and not self.emergency_stop_latched.is_set()
+            and not self.motion_stop_latched()
             and isinstance(linear_x, (int, float))
             and not isinstance(linear_x, bool)
             and isinstance(angular_z, (int, float))
@@ -1644,7 +2148,7 @@ class WebBridgeNode(Node):
             or map_operation_active
             or mapping_active
             or self.active_localization_command is not None
-            or self.emergency_stop_latched.is_set()
+            or self.motion_stop_latched()
         )
         if not valid or blocked:
             detail = (
@@ -1686,7 +2190,7 @@ class WebBridgeNode(Node):
             and not scan_active
             and not navigation_active
             and not mapping_active
-            and not self.emergency_stop_latched.is_set()
+            and not self.motion_stop_latched()
             and isinstance(linear_x, (int, float))
             and not isinstance(linear_x, bool)
             and isinstance(angular_z, (int, float))
@@ -1742,7 +2246,7 @@ class WebBridgeNode(Node):
             not recovery_active
             or navigation_active
             or mapping_active
-            or self.emergency_stop_latched.is_set()
+            or self.motion_stop_latched()
         ):
             self.get_logger().warning('Rejected unsafe localization scan command')
             return
@@ -1771,7 +2275,7 @@ class WebBridgeNode(Node):
             or navigation_active
             or mapping_active
             or timed_out
-            or self.emergency_stop_latched.is_set()
+            or self.motion_stop_latched()
         ):
             with self.localization_lock:
                 self.localization_scan_active = False
@@ -2250,8 +2754,14 @@ class WebBridgeNode(Node):
     def publish_zero_velocity(self) -> None:
         self.emergency_velocity_publisher.publish(Twist())
 
+    def motion_stop_latched(self) -> bool:
+        physical_latch = getattr(self, 'physical_estop_latched', None)
+        return self.emergency_stop_latched.is_set() or (
+            physical_latch is not None and physical_latch.is_set()
+        )
+
     def publish_emergency_zero(self) -> None:
-        if self.emergency_stop_latched.is_set():
+        if self.motion_stop_latched():
             self.publish_zero_velocity()
 
     async def queue_navigation_command(
@@ -2265,7 +2775,36 @@ class WebBridgeNode(Node):
         stage = message.get('stage')
         target = message.get('target')
 
-        if self.emergency_stop_latched.is_set():
+        rejection = self.navigation_command_rejection(message)
+        if rejection is not None:
+            await self.send_json(
+                websocket,
+                self.command_status_payload(
+                    message,
+                    'rejected',
+                    rejection,
+                ),
+            )
+            await self.send_json(
+                websocket,
+                {
+                    'type': 'command_ack',
+                    'command_id': command_id,
+                    'accepted': False,
+                    'detail': rejection,
+                },
+            )
+            return
+
+        if self.motion_stop_latched():
+            await self.send_json(
+                websocket,
+                self.command_status_payload(
+                    message,
+                    'rejected',
+                    'Emergency Stop is latched',
+                ),
+            )
             await self.send_json(
                 websocket,
                 {
@@ -2298,6 +2837,14 @@ class WebBridgeNode(Node):
         if not valid_command:
             await self.send_json(
                 websocket,
+                self.command_status_payload(
+                    message,
+                    'rejected',
+                    'Invalid navigate_to_pose command',
+                ),
+            )
+            await self.send_json(
+                websocket,
                 {
                     'type': 'command_ack',
                     'command_id': command_id,
@@ -2316,12 +2863,27 @@ class WebBridgeNode(Node):
             duplicate = (
                 command_id == active_id
                 or command_id in self.pending_command_ids
+                or command_id in self.processed_command_ids
             )
 
             if not duplicate:
                 self.pending_command_ids.add(command_id)
+                self.processed_command_ids[command_id] = None
+                while (
+                    len(self.processed_command_ids)
+                    > self.processed_command_limit
+                ):
+                    self.processed_command_ids.popitem(last=False)
 
         if duplicate:
+            await self.send_json(
+                websocket,
+                self.command_status_payload(
+                    message,
+                    'accepted',
+                    'Command was already processed',
+                ),
+            )
             await self.send_json(
                 websocket,
                 {
@@ -2334,9 +2896,76 @@ class WebBridgeNode(Node):
             return
 
         self.command_queue.put(message)
+        await self.send_json(
+            websocket,
+            self.command_status_payload(
+                message,
+                'accepted',
+                'Command accepted into the local execution queue',
+            ),
+        )
         self.get_logger().info(
             f'Queued Nav2 command {command_id}'
         )
+
+    def navigation_command_rejection(
+        self,
+        message: dict[str, Any],
+    ) -> str | None:
+        addressed_robot = message.get('robot_id')
+        if (
+            addressed_robot is not None
+            and addressed_robot != self.robot_id
+        ):
+            return 'Command is addressed to another robot'
+
+        expected_profile = message.get('expected_profile_version')
+        if (
+            expected_profile is not None
+            and expected_profile != self.profile_version
+        ):
+            return 'Robot profile version does not match the command'
+
+        expected_map_revision = message.get('expected_map_revision')
+        if (
+            expected_map_revision is not None
+            and expected_map_revision != self.map_revision
+        ):
+            return 'Map revision does not match the command'
+
+        expires_at = message.get('expires_at')
+        if expires_at is None:
+            return None
+        if not isinstance(expires_at, str):
+            return 'Command expiry is invalid'
+
+        try:
+            normalized = expires_at.replace('Z', '+00:00')
+            expiry = datetime.fromisoformat(normalized)
+            if expiry.tzinfo is None:
+                return 'Command expiry must include a timezone'
+            if expiry <= datetime.now(timezone.utc):
+                return 'Command has expired'
+        except ValueError:
+            return 'Command expiry is invalid'
+
+        return None
+
+    def command_status_payload(
+        self,
+        command: dict[str, Any],
+        lifecycle: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        return {
+            'type': 'command_status',
+            'protocol_version': '1.0',
+            'command_id': command.get('command_id') or 'unknown',
+            'robot_id': self.robot_id,
+            'lifecycle': lifecycle,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'detail': detail,
+        }
 
     def process_cancel_queue(self) -> bool:
         try:
@@ -2880,6 +3509,7 @@ class WebBridgeNode(Node):
                     self.robot_id,
                 )
             )
+            self.send_from_ros(self.agent_readiness_snapshot())
         self.get_logger().info(
             f"Map switch {command_id}: {'succeeded' if accepted else 'failed'}"
         )
@@ -2897,7 +3527,7 @@ class WebBridgeNode(Node):
             ):
                 return
 
-        if self.emergency_stop_latched.is_set():
+        if self.motion_stop_latched():
             self.clear_command_queue()
             return
 
@@ -3102,6 +3732,11 @@ class WebBridgeNode(Node):
             command,
             True,
             'Nav2 accepted the navigation goal',
+        )
+        self.send_command_status(
+            command,
+            'started',
+            'Nav2 started the navigation goal',
         )
 
         result_future = (
@@ -3447,12 +4082,31 @@ class WebBridgeNode(Node):
             }
         )
 
+    def send_command_status(
+        self,
+        command: dict[str, Any],
+        lifecycle: str,
+        detail: str,
+    ) -> None:
+        self.send_from_ros(
+            self.command_status_payload(
+                command,
+                lifecycle,
+                detail,
+            )
+        )
+
     def send_navigation_result(
         self,
         command: dict[str, Any],
         status: str,
         detail: str,
     ) -> None:
+        self.send_command_status(
+            command,
+            'succeeded' if status == 'succeeded' else 'failed',
+            detail,
+        )
         self.send_from_ros(
             {
                 'type': 'navigation_result',
@@ -3545,9 +4199,11 @@ class WebBridgeNode(Node):
     def destroy_node(self) -> bool:
         self.stop_requested.set()
         self.emergency_stop_latched.clear()
+        self.physical_estop_latched.clear()
         self.mapping_runtime.shutdown()
         self.destroy_timer(self.preview_timer)
         self.destroy_timer(self.emergency_zero_timer)
+        self.destroy_timer(self.physical_estop_watchdog_timer)
         self.destroy_timer(self.mapping_deadman_timer)
         self.destroy_timer(self.mapping_pose_timer)
         self.destroy_publisher(

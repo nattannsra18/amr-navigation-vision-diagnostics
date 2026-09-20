@@ -17,6 +17,7 @@ class FakeProcess:
 
 def test_mapping_runtime_transitions_and_saves_validated_map(tmp_path, monkeypatch):
     calls = []
+    launched = []
 
     def run(arguments, **_kwargs):
         calls.append(arguments)
@@ -33,13 +34,19 @@ def test_mapping_runtime_transitions_and_saves_validated_map(tmp_path, monkeypat
         return SimpleNamespace(returncode=0, stdout=output, stderr='')
 
     monkeypatch.setattr('amr_web_bridge.mapping_runtime.os.killpg', lambda *_args: None)
+
+    def popen(arguments, **_kwargs):
+        launched.append(arguments)
+        return FakeProcess()
+
     runtime = MappingRuntime(
         str(tmp_path),
         run=run,
-        popen=lambda *_args, **_kwargs: FakeProcess(),
+        popen=popen,
         sleep=lambda _seconds: None,
     )
     runtime.start('mapping:robot01:abc')
+    assert 'online_sync_launch.py' in launched[0]
     assert runtime.snapshot(2)['phase'] == 'MAPPING'
     runtime.stop_capture()
     assert runtime.snapshot(3)['phase'] == 'REVIEW'
