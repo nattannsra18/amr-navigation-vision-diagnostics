@@ -96,3 +96,39 @@ def test_physical_contract_requires_fresh_battery_and_estop_state():
         if item['status'] == 'FAIL'
     }
     assert 'capability.physical_estop_clear' in failed
+
+
+def test_prototype_reports_missing_safety_interfaces_without_faking_ready():
+    observation = healthy_observation()
+    observation.update({
+        'hardware_contract_mode': 'prototype',
+        'battery_age_seconds': None,
+        'physical_estop_age_seconds': None,
+        'physical_estop_latched': False,
+    })
+    report = validate_robot_profile(['navigation'], observation)
+    assert report['status'] == 'DEGRADED'
+    status_by_id = {
+        item['check_id']: item['status']
+        for item in report['checks']
+    }
+    assert status_by_id['data.battery'] == 'WARN'
+    assert status_by_id['data.physical_estop'] == 'WARN'
+    assert status_by_id['capability.physical_estop_clear'] == 'PASS'
+    assert status_by_id['capability.prototype_safety'] == 'WARN'
+
+
+def test_prototype_still_fails_when_physical_estop_is_latched():
+    observation = healthy_observation()
+    observation.update({
+        'hardware_contract_mode': 'prototype',
+        'battery_age_seconds': None,
+        'physical_estop_age_seconds': 0.2,
+        'physical_estop_latched': True,
+    })
+    report = validate_robot_profile(['navigation'], observation)
+    assert report['status'] == 'NOT_READY'
+    assert next(
+        item for item in report['checks']
+        if item['check_id'] == 'capability.physical_estop_clear'
+    )['status'] == 'FAIL'

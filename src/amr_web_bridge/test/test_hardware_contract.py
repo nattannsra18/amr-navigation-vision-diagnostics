@@ -196,3 +196,18 @@ def test_physical_estop_watchdog_is_disabled_for_simulation():
 
     WebBridgeNode.enforce_physical_estop_watchdog(bridge)
     assert bridge.latch_count == 0
+
+
+def test_physical_estop_watchdog_does_not_fabricate_a_prototype_stop():
+    bridge = SimpleNamespace(
+        hardware_contract_mode='prototype',
+        physical_estop_stale_seconds=2.0,
+        last_physical_estop_monotonic=None,
+        latch_count=0,
+    )
+    bridge.latch_physical_estop = lambda: setattr(
+        bridge, 'latch_count', bridge.latch_count + 1
+    )
+
+    WebBridgeNode.enforce_physical_estop_watchdog(bridge)
+    assert bridge.latch_count == 0

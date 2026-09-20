@@ -43,6 +43,13 @@ real battery and physical E-stop gates; a passing simulation report is not a
 physical safety certification. Topic, action, service, and base-frame names
 can be supplied through the environment variables shown by `--help`.
 
+The repository also includes
+`config/profiles/odroid_c4_tt_prototype.yaml` for the current ODROID-C4 robot.
+It consumes real ROS and Nav2 data but reports `DEGRADED` while battery and
+physical E-stop topics are absent. This permits authenticated telemetry and
+attended integration without misrepresenting the prototype as production-ready
+or making it eligible for unattended delivery assignment.
+
 ## Demo Video
 
 The demonstration video shows the interactive automated test checking ROS 2 discovery, AMCL localization, TF connectivity, Nav2 lifecycle states, sensor streams, frame IDs, navigation commands, ArUco detection, pose estimation, marker TF, and AMR health diagnostics.

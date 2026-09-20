@@ -31,3 +31,17 @@ def test_physical_profile_is_an_explicit_non_secret_template():
     assert profile['physical_estop_topic'] == '/safety/physical_estop'
     assert 'credential' not in profile
     assert 'token' not in profile
+
+
+def test_odroid_prototype_profile_uses_real_robot_interfaces():
+    profile = parameters('odroid_c4_tt_prototype.yaml')
+    assert profile['robot_serial_number'] == 'AMR-ODROID-C4-001'
+    assert profile['profile_version'] == 'odroid-c4-tt-prototype-v1'
+    assert profile['hardware_contract_mode'] == 'prototype'
+    assert profile['odom_topic'] == '/odometry/filtered'
+    assert profile['scan_topic'] == '/scan'
+    assert profile['diagnostics_topic'] == '/diagnostics'
+    assert profile['emergency_stop_cmd_vel_topic'] == '/cmd_vel'
+    assert 'mapping' not in profile['agent_capabilities'].split(',')
+    assert 'credential' not in profile
+    assert 'token' not in profile

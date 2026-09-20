@@ -219,7 +219,9 @@ def validate_robot_profile(
             'Diagnostics topic',
         )
 
-    if observation.get('hardware_contract_mode') == 'physical':
+    hardware_contract_mode = observation.get('hardware_contract_mode')
+    if hardware_contract_mode in {'physical', 'prototype'}:
+        prototype = hardware_contract_mode == 'prototype'
         for check_id, age_key, label in (
             ('data.battery', 'battery_age_seconds', 'Battery state'),
             (
@@ -242,6 +244,7 @@ def validate_robot_profile(
                     'never received'
                     if age is None else f'{float(age):.2f} s old'
                 ),
+                warning=prototype and not passed,
             )
         physical_estop_latched = bool(
             observation.get('physical_estop_latched')
@@ -257,6 +260,19 @@ def validate_robot_profile(
             ),
             observed='latched' if physical_estop_latched else 'clear',
         )
+        if prototype:
+            add(
+                'capability.prototype_safety',
+                'CAPABILITY',
+                False,
+                (
+                    'Prototype deployment is not eligible for unattended '
+                    'delivery until battery and physical Emergency Stop '
+                    'interfaces are commissioned'
+                ),
+                observed='prototype',
+                warning=True,
+            )
 
     map_received = observation.get('map_age_seconds') is not None
     if declared & {'navigation', 'localization', 'mapping'}:

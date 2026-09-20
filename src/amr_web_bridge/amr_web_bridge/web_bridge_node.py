@@ -235,9 +235,14 @@ class WebBridgeNode(Node):
         self.hardware_contract_mode = str(
             self.get_parameter('hardware_contract_mode').value
         ).strip().lower()
-        if self.hardware_contract_mode not in {'physical', 'simulation'}:
+        if self.hardware_contract_mode not in {
+            'physical',
+            'prototype',
+            'simulation',
+        }:
             raise ValueError(
-                'hardware_contract_mode must be physical or simulation'
+                'hardware_contract_mode must be physical, prototype, '
+                'or simulation'
             )
         self.diagnostics_topic = str(
             self.get_parameter('diagnostics_topic').value
@@ -279,9 +284,9 @@ class WebBridgeNode(Node):
             max(0, int(self.get_parameter('battery_percent').value)),
         )
         self.battery_source = (
-            'UNAVAILABLE'
-            if self.hardware_contract_mode == 'physical'
-            else 'SIMULATED'
+            'SIMULATED'
+            if self.hardware_contract_mode == 'simulation'
+            else 'UNAVAILABLE'
         )
         self.navigate_action = str(
             self.get_parameter('navigate_action').value
