@@ -1,0 +1,18 @@
+amr_base_serial_bridge:
+  ros__parameters:
+    port: /dev/ttyAML6
+    baud: 115200
+    left_cpr: 2362.4
+    right_cpr: 2367.0
+    # Measured physical geometry. Radius still needs a loaded floor roll test.
+    wheel_radius: 0.0325
+    # Centre-to-centre tread: average of 0.38 m outside and 0.33 m inside.
+    wheel_separation: 0.355
+    # Corrects the stationary magnitude observed near 1.067 g.
+    accel_scale: 0.9372
+    max_rpm: 90.0
+    cmd_vel_timeout: 0.25
+    enable_motors: false
+    odom_frame: odom
+    base_frame: base_footprint
+    imu_frame: imu_link

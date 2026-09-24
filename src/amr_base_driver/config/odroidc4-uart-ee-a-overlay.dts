@@ -1,0 +1,16 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "hardkernel,odroid-c4", "amlogic,sm1";
+
+	fragment@0 {
+		target = <&uart_A>;
+
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart_a_pins>;
+		};
+	};
+};
